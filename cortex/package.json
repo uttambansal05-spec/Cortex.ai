@@ -1,0 +1,27 @@
+{
+  "name": "cortex",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "turbo run dev",
+    "dev:all": "concurrently -n web,api,worker -c cyan,magenta,yellow \"pnpm --filter @cortex/web dev\" \"pnpm api:dev\" \"pnpm worker:dev\"",
+    "api:dev": "cd apps/api && uvicorn main:app --host 0.0.0.0 --port 8000 --reload",
+    "worker:dev": "cd apps/api && celery -A workers.build_brain.celery_app worker --loglevel=info",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "type-check": "turbo run type-check",
+    "db:push": "supabase db push",
+    "db:reset": "supabase db reset"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "concurrently": "^8.2.0"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}

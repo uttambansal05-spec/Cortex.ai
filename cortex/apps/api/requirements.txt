@@ -1,0 +1,30 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.0
+pydantic-settings==2.2.0
+
+# Database
+supabase==2.4.3
+asyncpg==0.29.0
+
+# AI
+anthropic==0.26.0
+google-generativeai==0.7.0
+
+# Workers / Queue
+celery==5.4.0
+redis==5.0.4
+
+# GitHub integration
+PyGithub==2.3.0
+gitpython==3.1.43
+
+# HTTP
+httpx==0.27.0
+aiohttp==3.9.0
+
+# Utilities
+python-dotenv==1.0.1
+structlog==24.1.0
+tenacity==8.3.0
+tiktoken==0.7.0
