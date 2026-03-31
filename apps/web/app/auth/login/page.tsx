@@ -3,7 +3,6 @@
 import { useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Brain, ArrowRight, Loader2 } from 'lucide-react'
-import { useRouter } from 'next/navigation'
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -11,29 +10,25 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const [isSignUp, setIsSignUp] = useState(false)
   const [error, setError] = useState('')
-  const router = useRouter()
   const supabase = createClient()
 
   const handleSubmit = async (e: React.FormEvent) => {
-  e.preventDefault()
-  setLoading(true)
-  setError('')
+    e.preventDefault()
+    setLoading(true)
+    setError('')
 
-  if (isSignUp) {
-    const { error } = await supabase.auth.signUp({ email, password })
+    if (isSignUp) {
+      const { error } = await supabase.auth.signUp({ email, password })
+      if (error) { setError(error.message); setLoading(false); return }
+    }
+
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
     if (error) { setError(error.message); setLoading(false); return }
-  }
 
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-  if (error) { setError(error.message); setLoading(false); return }
-  
-  if (data.session) {
-    await supabase.auth.setSession(data.session)
-    window.location.replace('/dashboard')
-  }
-}
-
-window.location.href = '/dashboard'
+    if (data.session) {
+      await supabase.auth.setSession(data.session)
+      window.location.replace('/dashboard')
+    }
   }
 
   return (
