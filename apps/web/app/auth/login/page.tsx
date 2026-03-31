@@ -15,19 +15,23 @@ export default function LoginPage() {
   const supabase = createClient()
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true)
-    setError('')
+  e.preventDefault()
+  setLoading(true)
+  setError('')
 
-    if (isSignUp) {
-      const { error } = await supabase.auth.signUp({ email, password })
-      if (error) { setError(error.message); setLoading(false); return }
-      const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
-      if (signInError) { setError(signInError.message); setLoading(false); return }
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password })
-      if (error) { setError(error.message); setLoading(false); return }
-    }
+  if (isSignUp) {
+    const { error } = await supabase.auth.signUp({ email, password })
+    if (error) { setError(error.message); setLoading(false); return }
+  }
+
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+  if (error) { setError(error.message); setLoading(false); return }
+  
+  if (data.session) {
+    await supabase.auth.setSession(data.session)
+    window.location.replace('/dashboard')
+  }
+}
 
 window.location.href = '/dashboard'
   }
