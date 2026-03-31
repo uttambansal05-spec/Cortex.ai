@@ -18,7 +18,10 @@ export default function LoginPage() {
     setError('')
     const { error } = await supabase.auth.signInWithOtp({
       email: email.trim(),
-      options: { shouldCreateUser: true }
+  options: { 
+    shouldCreateUser: true,
+    data: {}
+  }
     })
     if (error) { setError(error.message); setLoading(false); return }
     setSent(true)
