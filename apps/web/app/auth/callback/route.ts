@@ -1,19 +1,8 @@
-import { createClient } from '@/lib/supabase/server'
 import { NextRequest, NextResponse } from 'next/server'
 
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url)
-  const code = searchParams.get('code')
-  const next = searchParams.get('next') ?? '/dashboard'
-
-  if (code) {
-    const supabase = createClient()
-    const { error } = await supabase.auth.exchangeCodeForSession(code)
-    if (!error) {
-      return NextResponse.redirect(`${origin}${next}`)
-    }
-  }
-
-  // Implicit flow — token is in URL hash, handled client-side
+  const { origin } = new URL(request.url)
+  // Just redirect to dashboard — implicit flow token is in hash
+  // Client-side Supabase will pick it up automatically
   return NextResponse.redirect(`${origin}/dashboard`)
 }
