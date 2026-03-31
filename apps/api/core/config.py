@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_KEY: str  # service role key — never expose to frontend
 
     # AI
-    ANTHROPIC_API_KEY: str = ""
-    GEMINI_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str
+    GEMINI_API_KEY: str
 
     # GitHub App
     GITHUB_APP_ID: str = ""
