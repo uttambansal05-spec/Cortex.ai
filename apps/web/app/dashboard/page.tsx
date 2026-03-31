@@ -15,20 +15,10 @@ export default function DashboardPage() {
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (!session) {
-        router.push('/auth/login')
+        router.replace('/auth/login')
       } else {
         setUser(session.user)
         setLoading(false)
-      }
-    })
-
-    supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_IN' && session) {
-        setUser(session.user)
-        setLoading(false)
-      }
-      if (event === 'SIGNED_OUT') {
-        router.push('/auth/login')
       }
     })
   }, [])
@@ -36,10 +26,7 @@ export default function DashboardPage() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-background">
-        <div className="flex items-center gap-2">
-          <Brain className="w-4 h-4 text-accent animate-pulse" />
-          <span className="text-sm text-foreground-2">Loading...</span>
-        </div>
+        <Brain className="w-4 h-4 text-accent animate-pulse" />
       </div>
     )
   }

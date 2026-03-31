@@ -26,9 +26,6 @@ export async function middleware(request: NextRequest) {
   const isAuthRoute = request.nextUrl.pathname.startsWith('/auth')
   const isDashboardRoute = request.nextUrl.pathname.startsWith('/dashboard')
 
-  if (!user && isDashboardRoute) {
-    return NextResponse.redirect(new URL('/auth/login', request.url))
-  }
 
   if (user && isAuthRoute) {
     return NextResponse.redirect(new URL('/dashboard', request.url))
