@@ -65,7 +65,7 @@ def build_brain_task(
         if not repo_url:
             raise ValueError("No GitHub repo URL configured")
 
-        github_token = settings.GITHUB_APP_PRIVATE_KEY  # use proper token in prod
+        github_token = settings.GITHUB_TOKEN
 
         # Run async pipeline in sync context
         asyncio.run(_run_pipeline(

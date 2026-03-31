@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # GitHub App
     GITHUB_APP_ID: str = ""
     GITHUB_APP_PRIVATE_KEY: str = ""
+    GITHUB_TOKEN: str = ""
     GITHUB_WEBHOOK_SECRET: str = ""
 
     # Notion
