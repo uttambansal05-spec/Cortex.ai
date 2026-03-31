@@ -7,17 +7,17 @@ class Settings(BaseSettings):
 
     # Supabase
     SUPABASE_URL: str
-    SUPABASE_SERVICE_KEY: str  # service role key — never expose to frontend
+    SUPABASE_SERVICE_KEY: str
 
     # AI
-    ANTHROPIC_API_KEY: str
-    GEMINI_API_KEY: str
+    ANTHROPIC_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
 
-    # GitHub App
+    # GitHub
     GITHUB_APP_ID: str = ""
     GITHUB_APP_PRIVATE_KEY: str = ""
-    GITHUB_TOKEN: str = ""
     GITHUB_WEBHOOK_SECRET: str = ""
+    GITHUB_TOKEN: str = ""
 
     # Notion
     NOTION_API_KEY: str = ""
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     # Limits
     MAX_REPO_SIZE_MB: int = 500
     MAX_FILE_SIZE_KB: int = 500
-    GEMINI_REQUESTS_PER_MIN: int = 15   # free tier
+    GEMINI_REQUESTS_PER_MIN: int = 15
     CLAUDE_REQUESTS_PER_MIN: int = 50
 
     class Config:
