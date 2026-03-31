@@ -15,7 +15,6 @@
     "react-dom": "^18.3.0",
     "@supabase/supabase-js": "^2.43.0",
     "@supabase/ssr": "^0.3.0",
-    "@cortex/shared": "workspace:*",
     "lucide-react": "^0.379.0",
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.3.0",

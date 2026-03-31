@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Brain, AlertTriangle, CheckCircle2, Loader2, XCircle } from 'lucide-react'
-import type { BrainSnapshot } from '@cortex/shared'
+import type { BrainSnapshot } from '@/lib/types'
 
 interface Props {
   snapshot?: BrainSnapshot | null

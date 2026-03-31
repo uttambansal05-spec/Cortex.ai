@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { NODE_TYPE_CONFIG, type NodeType, type BrainNode } from '@cortex/shared'
+import { NODE_TYPE_CONFIG, type NodeType, type BrainNode } from '@/lib/types'
 
 const TYPES: NodeType[] = ['entity', 'decision', 'risk', 'gap', 'dependency', 'flow', 'api', 'model']
 
