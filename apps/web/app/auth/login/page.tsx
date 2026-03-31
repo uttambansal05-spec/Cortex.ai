@@ -13,21 +13,20 @@ export default function LoginPage() {
   const supabase = createClient()
 
   const handleSendOtp = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true)
-    setError('')
-    const { error } = await supabase.auth.signInWithOtp({
-      email: email.trim(),
-  options: { 
-    shouldCreateUser: true,
-    data: {}
-  }
-    })
-    if (error) { setError(error.message); setLoading(false); return }
-    setSent(true)
-    setLoading(false)
-  }
-
+  e.preventDefault()
+  setLoading(true)
+  setError('')
+  const { error } = await supabase.auth.signInWithOtp({
+    email: email.trim(),
+    options: { 
+      shouldCreateUser: true,
+      emailRedirectTo: undefined
+    }
+  })
+  if (error) { setError(error.message); setLoading(false); return }
+  setSent(true)
+  setLoading(false)
+}
   const handleVerifyOtp = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
