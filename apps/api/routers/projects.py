@@ -9,12 +9,18 @@ log = structlog.get_logger()
 
 
 def _get_workspace_id(authorization: str) -> str:
-    """Extract user ID from Supabase JWT — simplified; use proper JWT decode in prod."""
-    supabase = get_supabase()
-    user = supabase.auth.get_user(authorization.replace("Bearer ", ""))
-    if not user.user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user.user.id
+    """Extract user ID from Supabase JWT."""
+    try:
+        token = authorization.replace("Bearer ", "").strip()
+        supabase = get_supabase()
+        response = supabase.auth.get_user(token)
+        if not response or not response.user:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return response.user.id
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Auth error: {str(e)}")
 
 
 @router.get("/")
