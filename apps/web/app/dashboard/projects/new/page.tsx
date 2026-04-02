@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, Github, Loader2, ArrowRight } from 'lucide-react'
 import Link from 'next/link'
+import { createClient } from '@/lib/supabase/client'
 
 export default function NewProjectPage() {
   const router = useRouter()
@@ -14,6 +15,7 @@ export default function NewProjectPage() {
     github_repo_url: '',
     default_branch: 'main',
   })
+  const supabase = createClient()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -23,9 +25,14 @@ export default function NewProjectPage() {
     setError('')
 
     try {
-      const res = await fetch('/api/v1/projects/', {
+      const { data: { session } } = await supabase.auth.getSession()
+      
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`,
+        },
         body: JSON.stringify({
           name: form.name,
           github_repo_url: form.github_repo_url,
