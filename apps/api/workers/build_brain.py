@@ -1,4 +1,8 @@
 import asyncio
+import sys
+import os
+sys.path.insert(0, '/app')
+
 from celery import Celery
 from core.config import settings
 from core.database import get_supabase
