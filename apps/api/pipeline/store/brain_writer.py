@@ -26,23 +26,28 @@ def _fingerprint(node_type: str, label: str, project_id: str) -> str:
 
 def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]:
     rows = []
-    log.info("brain_writer.graph_keys", keys=list(graph.keys()))
+    seen_fingerprints = set()
 
     for graph_key, node_type in NODE_TYPE_MAP.items():
         items = graph.get(graph_key, [])
         log.info("brain_writer.processing_key", key=graph_key, count=len(items))
-        
+
         for item in items:
             if not isinstance(item, dict):
                 continue
-                
+
             label = (
-                item.get("label") or 
-                item.get("from_entity") or 
+                item.get("label") or
+                item.get("from_entity") or
                 item.get("name") or ""
             )
             if not label:
                 continue
+
+            fp = _fingerprint(node_type, str(label), project_id)
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
 
             summary = (
                 item.get("summary") or
@@ -65,7 +70,7 @@ def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]
                              if k not in ("label", "summary", "detail", "rationale")},
                 "source_file": source_file,
                 "source_pr": None,
-                "fingerprint": _fingerprint(node_type, str(label), project_id),
+                "fingerprint": fp,
             })
 
     return rows
@@ -78,7 +83,7 @@ async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
         "status": "building",
     }).eq("id", snapshot_id).execute()
 
-    log.info("brain_writer.graph_received", 
+    log.info("brain_writer.graph_received",
              entity_count=len(graph.get("entities", [])),
              risk_count=len(graph.get("risks", [])),
              gap_count=len(graph.get("gaps", [])))
@@ -86,13 +91,10 @@ async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
     nodes = _extract_nodes(graph, project_id, snapshot_id)
     log.info("brain_writer.writing_nodes", count=len(nodes), snapshot_id=snapshot_id)
 
-    batch_size = 100
+    batch_size = 50
     for i in range(0, len(nodes), batch_size):
         batch = nodes[i:i + batch_size]
-        db.table("brain_nodes").upsert(
-            batch,
-            on_conflict="fingerprint",
-        ).execute()
+        db.table("brain_nodes").insert(batch).execute()
 
     by_type: dict[str, int] = {}
     for node in nodes:
