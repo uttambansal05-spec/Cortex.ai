@@ -46,12 +46,21 @@ async def create_project(
     payload: ProjectCreate,
     authorization: str = Header(...),
 ):
-    workspace_id = _get_workspace_id(authorization)
+    user_id = _get_workspace_id(authorization)
     db = get_supabase()
 
-    # Extract GitHub repo ID from URL
-    repo_parts = payload.github_repo_url.rstrip("/").split("/")
-    repo_name = f"{repo_parts[-2]}/{repo_parts[-1]}"
+    # Look up workspace by owner_id
+    workspace = (
+        db.table("workspaces")
+        .select("id")
+        .eq("owner_id", user_id)
+        .single()
+        .execute()
+    )
+    if not workspace.data:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    workspace_id = workspace.data["id"]
 
     result = (
         db.table("projects")
