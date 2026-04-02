@@ -27,12 +27,11 @@ export default function NewProjectPage() {
     try {
       const { data: { session } } = await supabase.auth.getSession()
       
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session?.access_token}`,
-        },
+      const res = await fetch(`/api/projects`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
         body: JSON.stringify({
           name: form.name,
           github_repo_url: form.github_repo_url,
