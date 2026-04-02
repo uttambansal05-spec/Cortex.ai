@@ -66,7 +66,7 @@ class QueryAgent:
         product_summary = snap.get("metadata", {}).get("product_summary", {})
 
         message = _client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-opus-4-6",
             max_tokens=1500,
             messages=[{
                 "role": "user",

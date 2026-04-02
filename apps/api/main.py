@@ -5,7 +5,7 @@ import structlog
 
 from core.config import settings
 from core.database import init_db
-from routers import projects, brain, agents, webhooks
+from routers import projects, brain, agents, webhooks, api_keys, connector
 
 log = structlog.get_logger()
 
@@ -38,6 +38,8 @@ app.include_router(projects.router, prefix="/api/v1/projects", tags=["projects"]
 app.include_router(brain.router, prefix="/api/v1/brain", tags=["brain"])
 app.include_router(agents.router, prefix="/api/v1/agents", tags=["agents"])
 app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["webhooks"])
+app.include_router(api_keys.router, prefix="/api/v1/keys", tags=["api-keys"])
+app.include_router(connector.router, prefix="/api/v1/connector", tags=["connector"])
 
 
 @app.get("/health")
