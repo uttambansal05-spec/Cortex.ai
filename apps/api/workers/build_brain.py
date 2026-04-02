@@ -116,5 +116,6 @@ async def _run_pipeline(
     graph = await synthesise_extractions(extractions)
     log.info("pipeline.synthesise.complete")
 
+    log.info("pipeline.graph_preview", entities=len(graph.get("entities", [])), risks=len(graph.get("risks", [])), gaps=len(graph.get("gaps", [])))
     await write_brain(graph, project_id, snapshot_id)
     log.info("pipeline.store.complete")
