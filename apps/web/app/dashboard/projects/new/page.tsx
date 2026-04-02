@@ -16,13 +16,53 @@ export default function NewProjectPage() {
     default_branch: 'main',
   })
   const supabase = createClient()
+  useEffect(() => {
+  supabase.auth.getSession().then(({data}) => {
+    console.log('Session check:', data.session?.user?.email, 'Token:', data.session?.access_token?.substring(0, 20))
+  })
+}, [])
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!form.name || !form.github_repo_url) return
+const handleSubmit = async (e: React.FormEvent) => {
+  e.preventDefault()
+  if (!form.name || !form.github_repo_url) return
 
-    setLoading(true)
-    setError('')
+  setLoading(true)
+  setError('')
+
+  try {
+    const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+    
+    if (!session) {
+      setError('Not logged in. Please refresh and try again.')
+      setLoading(false)
+      return
+    }
+
+    const res = await fetch(`/api/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session.access_token}`,
+      },
+      body: JSON.stringify({
+        name: form.name,
+        github_repo_url: form.github_repo_url,
+        config: { default_branch: form.default_branch },
+      }),
+    })
+
+    const data = await res.json()
+
+    if (!res.ok) {
+      throw new Error(data.detail || data.error || 'Failed to create project')
+    }
+
+    window.location.href = `/dashboard/projects/${data.id}`
+  } catch (err: any) {
+    setError(err.message)
+    setLoading(false)
+  }
+}
 
     try {
       const { data: { session } } = await supabase.auth.getSession()
