@@ -6,180 +6,107 @@ import structlog
 log = structlog.get_logger()
 _client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-SYNTHESISE_PROMPT = """You are building a knowledge graph for a Product Brain.
+SYNTHESISE_PROMPT = """Build a knowledge graph from these code extractions.
 
-You have extracted knowledge from {total_chunks} code chunks across {total_files} files.
-
-Raw extractions (JSON):
 {extractions_json}
 
-Synthesise into a unified knowledge graph. Return ONLY valid JSON:
+Return ONLY valid JSON:
 {{
-  "entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "dependencies": [], "source_files": [], "is_critical_path": false}}],
-  "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": [], "confidence": "high|medium|low"}}],
-  "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "affected_entities": [], "source_files": []}}],
-  "gaps": [{{"label": "Gap", "detail": "What is missing", "affected_areas": []}}],
+  "entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": []}}],
+  "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}],
+  "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}],
+  "gaps": [{{"label": "Gap", "detail": "What is missing"}}],
   "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}],
-  "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": [], "critical_path": false}}],
+  "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}],
   "product_summary": {{
     "what_it_does": "2-3 sentence description",
     "core_modules": [],
-    "primary_data_model": "",
-    "critical_paths": [],
     "tech_stack": [],
-    "total_entities": 0,
-    "total_apis": 0,
     "architecture_pattern": "monolith|microservices|serverless|hybrid"
   }}
-}}
-
-Rules: Merge duplicates. Empty arrays are fine. Return complete valid JSON only."""
+}}"""
 
 
-def _clean_json(text: str) -> str:
+def _clean_json(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     try:
-        json.loads(text)
-        return text
-    except json.JSONDecodeError:
-        pass
-    start = text.find('{')
-    if start == -1:
-        return '{}'
-    end = len(text)
-    while end > start:
-        try:
-            json.loads(text[start:end])
-            return text[start:end]
-        except json.JSONDecodeError:
-            end -= 1
-    return '{}'
+        return json.loads(text)
+    except Exception:
+        start = text.find('{')
+        if start == -1:
+            return {}
+        for end in range(len(text), start, -1):
+            try:
+                return json.loads(text[start:end])
+            except Exception:
+                continue
+        return {}
 
 
 def _empty_graph() -> dict:
     return {
         "entities": [], "decisions": [], "risks": [], "gaps": [],
         "dependencies": [], "user_flows": [],
-        "product_summary": {
-            "what_it_does": "Analysis incomplete.",
-            "core_modules": [], "primary_data_model": "",
-            "critical_paths": [], "tech_stack": [],
-            "total_entities": 0, "total_apis": 0,
-            "architecture_pattern": "unknown"
-        }
+        "product_summary": {"what_it_does": "", "core_modules": [], "tech_stack": [], "architecture_pattern": "unknown"}
     }
 
 
-def _pre_aggregate(extractions: list[dict]) -> dict:
-    aggregated: dict = {"by_file": {}, "total_chunks": len(extractions)}
-    for extraction in extractions:
-        source = extraction.get("_source", {})
-        file_path = source.get("file_path", "unknown")
-        if file_path not in aggregated["by_file"]:
-            aggregated["by_file"][file_path] = {
-                "entities": [], "decisions": [], "risks": [],
-                "gaps": [], "apis": [], "data_models": [], "module_summary": "",
-            }
-        file_data = aggregated["by_file"][file_path]
-        for key in ["entities", "decisions", "risks", "gaps", "apis", "data_models"]:
-            file_data[key].extend(extraction.get(key, []))
-        if extraction.get("module_summary"):
-            file_data["module_summary"] = extraction["module_summary"]
-    return aggregated
-
-
-def _merge_partial_results(partials: list[dict]) -> dict:
-    """Merge partial results — simple concatenation, no dedup."""
-    merged: dict = {
-        "entities": [],
-        "decisions": [],
-        "risks": [],
-        "gaps": [],
-        "dependencies": [],
-        "user_flows": [],
-        "product_summary": {},
-    }
-    for partial in partials:
-        for key in ["entities", "decisions", "risks", "gaps", "dependencies", "user_flows"]:
-            items = partial.get(key, [])
-            if isinstance(items, list):
-                merged[key].extend(items)
-        if partial.get("product_summary"):
-            merged["product_summary"] = partial["product_summary"]
+def _merge(partials: list[dict]) -> dict:
+    merged = {"entities": [], "decisions": [], "risks": [], "gaps": [], "dependencies": [], "user_flows": [], "product_summary": {}}
+    for p in partials:
+        for k in ["entities", "decisions", "risks", "gaps", "dependencies", "user_flows"]:
+            merged[k].extend(p.get(k, []) if isinstance(p.get(k), list) else [])
+        if p.get("product_summary"):
+            merged["product_summary"] = p["product_summary"]
     return merged
 
 
+def _pre_aggregate(extractions: list[dict]) -> dict:
+    by_file: dict = {}
+    for e in extractions:
+        fp = e.get("_source", {}).get("file_path", "unknown")
+        if fp not in by_file:
+            by_file[fp] = {"entities": [], "decisions": [], "risks": [], "gaps": [], "module_summary": ""}
+        for k in ["entities", "decisions", "risks", "gaps"]:
+            by_file[fp][k].extend(e.get(k, []))
+        if e.get("module_summary"):
+            by_file[fp]["module_summary"] = e["module_summary"]
+    return by_file
+
+
 async def synthesise_extractions(extractions: list[dict]) -> dict:
-    aggregated = _pre_aggregate(extractions)
-    extractions_json = json.dumps(aggregated, indent=2)
-    total_chars = len(extractions_json)
-
-    log.info("claude.synthesise.start", chunks=len(extractions), chars=total_chars)
-
-    MAX_CHARS = 150_000
-    if total_chars > MAX_CHARS:
-        return await _batch_synthesise(aggregated)
-
-    try:
-        message = _client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=8192,
-            messages=[{
-                "role": "user",
-                "content": SYNTHESISE_PROMPT.format(
-                    total_chunks=len(extractions),
-                    total_files=len(aggregated.get("by_file", {})),
-                    extractions_json=extractions_json,
-                )
-            }]
-        )
-        text = message.content[0].text
-        clean = _clean_json(text)
-        result = json.loads(clean)
-        log.info("claude.synthesise.complete",
-                 entities=len(result.get("entities", [])),
-                 risks=len(result.get("risks", [])))
-        return result
-    except Exception as e:
-        log.error("claude.synthesise.failed", error=str(e))
-        return _empty_graph()
-
-
-async def _batch_synthesise(aggregated: dict) -> dict:
-    files = list(aggregated["by_file"].items())
-    batch_size = 15
+    by_file = _pre_aggregate(extractions)
+    files = list(by_file.items())
+    batch_size = 12
     batches = [dict(files[i:i+batch_size]) for i in range(0, len(files), batch_size)]
-    partial_results = []
+    partials = []
+
+    log.info("claude.synthesise.start", total_files=len(files), total_batches=len(batches))
 
     for i, batch in enumerate(batches):
         log.info("claude.synthesise.batch", batch=i+1, total=len(batches))
-        batch_payload = {"by_file": batch, "total_chunks": len(batch)}
-        batch_json = json.dumps(batch_payload, indent=2)
+        payload = json.dumps({"files": batch}, indent=1)
+
+        if len(payload) > 80000:
+            payload = json.dumps({"files": batch}, separators=(',', ':'))
 
         try:
             message = _client.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=8192,
-                messages=[{
-                    "role": "user",
-                    "content": SYNTHESISE_PROMPT.format(
-                        total_chunks=len(batch),
-                        total_files=len(batch),
-                        extractions_json=batch_json,
-                    )
-                }]
+                max_tokens=4096,
+                timeout=90,
+                messages=[{"role": "user", "content": SYNTHESISE_PROMPT.format(extractions_json=payload)}]
             )
-            text = message.content[0].text
-            clean = _clean_json(text)
-            partial_results.append(json.loads(clean))
+            result = _clean_json(message.content[0].text)
+            partials.append(result if result else _empty_graph())
         except Exception as e:
-            log.error("claude.synthesise.batch_failed", batch=i+1, error=str(e))
-            partial_results.append(_empty_graph())
+            log.error("claude.synthesise.batch_failed", batch=i+1, error=str(e)[:200])
+            partials.append(_empty_graph())
 
-    result = _merge_partial_results(partial_results)
-    log.info("claude.synthesise.merged",
-             entities=len(result.get("entities", [])),
-             risks=len(result.get("risks", [])))
-    return result
+    merged = _merge(partials)
+    log.info("claude.synthesise.complete",
+             entities=len(merged.get("entities", [])),
+             risks=len(merged.get("risks", [])))
+    return merged
