@@ -4,7 +4,6 @@ from core.config import settings
 import structlog
 
 log = structlog.get_logger()
-
 _client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 SYNTHESISE_PROMPT = """You are building a knowledge graph for a Product Brain.
@@ -34,28 +33,21 @@ Synthesise into a unified knowledge graph. Return ONLY valid JSON:
   }}
 }}
 
-Rules: Merge duplicates. Empty arrays are fine. MUST return complete valid JSON."""
+Rules: Merge duplicates. Empty arrays are fine. Return complete valid JSON only."""
 
 
 def _clean_json(text: str) -> str:
-    """Try to extract valid JSON from potentially truncated response."""
     text = text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    
-    # Try parsing as-is first
     try:
         json.loads(text)
         return text
     except json.JSONDecodeError:
         pass
-    
-    # Try to find the JSON object
     start = text.find('{')
     if start == -1:
         return '{}'
-    
-    # Try progressively shorter strings to find valid JSON
     end = len(text)
     while end > start:
         try:
@@ -63,7 +55,6 @@ def _clean_json(text: str) -> str:
             return text[start:end]
         except json.JSONDecodeError:
             end -= 1
-    
     return '{}'
 
 
@@ -72,13 +63,52 @@ def _empty_graph() -> dict:
         "entities": [], "decisions": [], "risks": [], "gaps": [],
         "dependencies": [], "user_flows": [],
         "product_summary": {
-            "what_it_does": "Analysis incomplete due to API limits.",
+            "what_it_does": "Analysis incomplete.",
             "core_modules": [], "primary_data_model": "",
             "critical_paths": [], "tech_stack": [],
             "total_entities": 0, "total_apis": 0,
             "architecture_pattern": "unknown"
         }
     }
+
+
+def _pre_aggregate(extractions: list[dict]) -> dict:
+    aggregated: dict = {"by_file": {}, "total_chunks": len(extractions)}
+    for extraction in extractions:
+        source = extraction.get("_source", {})
+        file_path = source.get("file_path", "unknown")
+        if file_path not in aggregated["by_file"]:
+            aggregated["by_file"][file_path] = {
+                "entities": [], "decisions": [], "risks": [],
+                "gaps": [], "apis": [], "data_models": [], "module_summary": "",
+            }
+        file_data = aggregated["by_file"][file_path]
+        for key in ["entities", "decisions", "risks", "gaps", "apis", "data_models"]:
+            file_data[key].extend(extraction.get(key, []))
+        if extraction.get("module_summary"):
+            file_data["module_summary"] = extraction["module_summary"]
+    return aggregated
+
+
+def _merge_partial_results(partials: list[dict]) -> dict:
+    """Merge partial results — simple concatenation, no dedup."""
+    merged: dict = {
+        "entities": [],
+        "decisions": [],
+        "risks": [],
+        "gaps": [],
+        "dependencies": [],
+        "user_flows": [],
+        "product_summary": {},
+    }
+    for partial in partials:
+        for key in ["entities", "decisions", "risks", "gaps", "dependencies", "user_flows"]:
+            items = partial.get(key, [])
+            if isinstance(items, list):
+                merged[key].extend(items)
+        if partial.get("product_summary"):
+            merged["product_summary"] = partial["product_summary"]
+    return merged
 
 
 async def synthesise_extractions(extractions: list[dict]) -> dict:
@@ -117,24 +147,6 @@ async def synthesise_extractions(extractions: list[dict]) -> dict:
         return _empty_graph()
 
 
-def _pre_aggregate(extractions: list[dict]) -> dict:
-    aggregated: dict = {"by_file": {}, "total_chunks": len(extractions)}
-    for extraction in extractions:
-        source = extraction.get("_source", {})
-        file_path = source.get("file_path", "unknown")
-        if file_path not in aggregated["by_file"]:
-            aggregated["by_file"][file_path] = {
-                "entities": [], "decisions": [], "risks": [],
-                "gaps": [], "apis": [], "data_models": [], "module_summary": "",
-            }
-        file_data = aggregated["by_file"][file_path]
-        for key in ["entities", "decisions", "risks", "gaps", "apis", "data_models"]:
-            file_data[key].extend(extraction.get(key, []))
-        if extraction.get("module_summary"):
-            file_data["module_summary"] = extraction["module_summary"]
-    return aggregated
-
-
 async def _batch_synthesise(aggregated: dict) -> dict:
     files = list(aggregated["by_file"].items())
     batch_size = 30
@@ -166,26 +178,8 @@ async def _batch_synthesise(aggregated: dict) -> dict:
             log.error("claude.synthesise.batch_failed", batch=i+1, error=str(e))
             partial_results.append(_empty_graph())
 
-    return _merge_partial_results(partial_results)
-
-
-def _merge_partial_results(partials: list[dict]) -> dict:
-    merged: dict = {
-        "entities": [], "decisions": [], "risks": [],
-        "gaps": [], "dependencies": [], "user_flows": [],
-        "product_summary": {},
-    }
-    seen_labels: dict[str, set] = {k: set() for k in merged}
-
-    for partial in partials:
-        for key in ["entities", "decisions", "risks", "gaps", "dependencies", "user_flows"]:
-            for item in partial.get(key, []):
-                label = item.get("label", "")
-                if label and label not in seen_labels[key]:
-                    seen_labels[key].add(label)
-                    merged[key].append(item)
-
-    if partials:
-        merged["product_summary"] = partials[-1].get("product_summary", {})
-
-    return merged
+    result = _merge_partial_results(partial_results)
+    log.info("claude.synthesise.merged",
+             entities=len(result.get("entities", [])),
+             risks=len(result.get("risks", [])))
+    return result
