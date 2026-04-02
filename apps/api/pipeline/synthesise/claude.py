@@ -149,7 +149,7 @@ async def synthesise_extractions(extractions: list[dict]) -> dict:
 
 async def _batch_synthesise(aggregated: dict) -> dict:
     files = list(aggregated["by_file"].items())
-    batch_size = 30
+    batch_size = 15
     batches = [dict(files[i:i+batch_size]) for i in range(0, len(files), batch_size)]
     partial_results = []
 
