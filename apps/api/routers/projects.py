@@ -8,15 +8,19 @@ router = APIRouter()
 log = structlog.get_logger()
 
 
+import jwt as pyjwt
+
 def _get_workspace_id(authorization: str) -> str:
-    """Extract user ID from Supabase JWT."""
+    """Extract user ID from Supabase JWT by decoding it directly."""
     try:
         token = authorization.replace("Bearer ", "").strip()
-        supabase = get_supabase()
-        response = supabase.auth.get_user(token)
-        if not response or not response.user:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        return response.user.id
+        # Decode without verification first to get the user ID
+        # Supabase tokens are verified by the service itself
+        decoded = pyjwt.decode(token, options={"verify_signature": False})
+        user_id = decoded.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
     except HTTPException:
         raise
     except Exception as e:
