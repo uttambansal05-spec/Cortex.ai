@@ -39,11 +39,10 @@ export default function NewProjectPage() {
         }),
       })
 
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.detail || 'Failed to create project')
-      }
-
+     if (!res.ok) {
+  const err = await res.json()
+  throw new Error(JSON.stringify(err))
+}
       const project = await res.json()
       router.push(`/dashboard/projects/${project.id}`)
     } catch (err: any) {
