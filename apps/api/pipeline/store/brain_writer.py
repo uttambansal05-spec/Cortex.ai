@@ -18,6 +18,11 @@ NODE_TYPE_MAP = {
     "data_models":  "model",
 }
 
+EDGE_TYPE_MAP = {
+    "imports": "imports", "calls": "calls", "extends": "extends",
+    "uses": "uses", "triggers": "triggers", "depends_on": "depends_on",
+}
+
 
 def _fingerprint(node_type: str, label: str, project_id: str) -> str:
     key = f"{project_id}:{node_type}:{label.lower().strip()}"
@@ -26,39 +31,24 @@ def _fingerprint(node_type: str, label: str, project_id: str) -> str:
 
 def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]:
     rows = []
-    seen_fingerprints = set()
-
+    seen = set()
     for graph_key, node_type in NODE_TYPE_MAP.items():
-        items = graph.get(graph_key, [])
-        log.info("brain_writer.processing_key", key=graph_key, count=len(items))
-
-        for item in items:
+        for item in graph.get(graph_key, []):
             if not isinstance(item, dict):
                 continue
-
-            label = (
-                item.get("label") or
-                item.get("from_entity") or
-                item.get("name") or ""
-            )
+            label = item.get("label") or item.get("from_entity") or ""
             if not label:
                 continue
-
             fp = _fingerprint(node_type, str(label), project_id)
-            if fp in seen_fingerprints:
+            if fp in seen:
                 continue
-            seen_fingerprints.add(fp)
-
+            seen.add(fp)
             summary = (
-                item.get("summary") or
-                item.get("detail") or
-                item.get("rationale") or
+                item.get("summary") or item.get("detail") or item.get("rationale") or
                 f"{item.get('from_entity', '')} → {item.get('to_entity', '')}"
             )
-
             source_files = item.get("source_files") or []
             source_file = source_files[0] if source_files else item.get("source_file")
-
             rows.append({
                 "id": str(uuid.uuid4()),
                 "snapshot_id": snapshot_id,
@@ -71,30 +61,87 @@ def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]
                 "source_file": source_file,
                 "source_pr": None,
                 "fingerprint": fp,
+                "domain": "code",
+                "source_type": "github",
             })
-
     return rows
+
+
+def _extract_edges(graph: dict, label_to_id: dict, snapshot_id: str, project_id: str) -> list[dict]:
+    edges = []
+    seen = set()
+
+    def add_edge(from_label, to_label, edge_type, is_external=False):
+        from_id = label_to_id.get(from_label.lower().strip())
+        to_id = label_to_id.get(to_label.lower().strip())
+        if not from_id or not to_id:
+            return
+        key = f"{from_id}:{to_id}:{edge_type}"
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append({
+            "id": str(uuid.uuid4()),
+            "snapshot_id": snapshot_id,
+            "project_id": project_id,
+            "from_node": from_id,
+            "to_node": to_id,
+            "edge_type": edge_type,
+            "weight": 1.0,
+            "metadata": {"is_external": is_external},
+        })
+
+    for dep in graph.get("dependencies", []):
+        if not isinstance(dep, dict):
+            continue
+        from_e = dep.get("from_entity", "")
+        to_e = dep.get("to_entity", "")
+        edge_type = EDGE_TYPE_MAP.get(dep.get("type", ""), "depends_on")
+        if from_e and to_e:
+            add_edge(from_e, to_e, edge_type, dep.get("is_external", False))
+
+    for entity in graph.get("entities", []):
+        if not isinstance(entity, dict):
+            continue
+        from_label = entity.get("label", "")
+        for dep_label in entity.get("dependencies", []):
+            if dep_label and from_label:
+                add_edge(from_label, dep_label, "depends_on")
+
+    return edges
 
 
 async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
     db = get_supabase()
-
-    db.table("brain_snapshots").update({
-        "status": "building",
-    }).eq("id", snapshot_id).execute()
-
-    log.info("brain_writer.graph_received",
-             entity_count=len(graph.get("entities", [])),
-             risk_count=len(graph.get("risks", [])),
-             gap_count=len(graph.get("gaps", [])))
+    db.table("brain_snapshots").update({"status": "building"}).eq("id", snapshot_id).execute()
 
     nodes = _extract_nodes(graph, project_id, snapshot_id)
-    log.info("brain_writer.writing_nodes", count=len(nodes), snapshot_id=snapshot_id)
+    log.info("brain_writer.writing_nodes", count=len(nodes))
 
+    label_to_id = {}
     batch_size = 50
     for i in range(0, len(nodes), batch_size):
         batch = nodes[i:i + batch_size]
         db.table("brain_nodes").insert(batch).execute()
+        for n in batch:
+            label_to_id[n["label"].lower().strip()] = n["id"]
+
+    edges = _extract_edges(graph, label_to_id, snapshot_id, project_id)
+    if edges:
+        for i in range(0, len(edges), batch_size):
+            try:
+                db.table("brain_edges").insert(edges[i:i + batch_size]).execute()
+            except Exception as e:
+                log.warning("brain_writer.edge_insert_failed", error=str(e)[:100])
+
+    # Community detection
+    communities = []
+    try:
+        from pipeline.community.detector import detect_communities
+        communities = await detect_communities(project_id, snapshot_id, nodes)
+        log.info("brain_writer.communities_done", count=len(communities))
+    except Exception as e:
+        log.warning("brain_writer.community_detection_failed", error=str(e)[:200])
 
     by_type: dict[str, int] = {}
     for node in nodes:
@@ -104,6 +151,8 @@ async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
     product_summary = graph.get("product_summary", {})
     metadata = {
         "total_nodes": len(nodes),
+        "total_edges": len(edges),
+        "total_communities": len(communities),
         "by_type": by_type,
         "product_summary": product_summary,
     }
@@ -116,8 +165,5 @@ async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
     }).eq("id", snapshot_id).execute()
 
     log.info("brain_writer.complete",
-             snapshot_id=snapshot_id,
-             total_nodes=len(nodes),
-             by_type=by_type)
-
+             nodes=len(nodes), edges=len(edges), communities=len(communities))
     return metadata
