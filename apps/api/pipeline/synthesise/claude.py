@@ -84,7 +84,7 @@ def _pre_aggregate(extractions: list[dict]) -> dict:
 async def synthesise_extractions(extractions: list[dict]) -> dict:
     by_file = _pre_aggregate(extractions)
     files = list(by_file.items())
-    batch_size = 20
+    batch_size = 6
     batches = [dict(files[i:i+batch_size]) for i in range(0, len(files), batch_size)]
     partials = []
 

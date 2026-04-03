@@ -50,13 +50,13 @@ async def extract_chunk(chunk: Chunk) -> dict:
         return {"_source": {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}}
 
 
-async def extract_chunks_parallel(chunks: list[Chunk], max_concurrent: int = 2) -> list[dict]:
+async def extract_chunks_parallel(chunks: list[Chunk], max_concurrent: int = 1) -> list[dict]:
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def extract_with_semaphore(chunk: Chunk) -> dict:
         async with semaphore:
             result = await extract_chunk(chunk)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(3.0)
             return result
 
     log.info("extract.batch_start", total_chunks=len(chunks))

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
-        "https://cortex-omega-one.vercel.app",
+        "https://cortex-ai-web-rymo.vercel.app",
     ]
 
     # Limits
