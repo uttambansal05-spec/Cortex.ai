@@ -9,31 +9,14 @@ import structlog
 
 log = structlog.get_logger()
 
-# File types to ingest by category
 INGEST_EXTENSIONS = {
-    "code": {
-        ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".kt", ".swift",
-        ".go", ".rs", ".rb", ".php", ".cs", ".cpp", ".c", ".h",
-        ".scala", ".dart", ".r", ".m",
-    },
-    "config": {
-        ".json", ".yaml", ".yml", ".toml", ".env.example",
-        ".dockerfile", "dockerfile",
-    },
-    "docs": {
-        ".md", ".mdx", ".txt", ".rst",
-    },
-    "web": {
-        ".html", ".css", ".scss", ".sass", ".vue", ".svelte",
-    },
-    "android": {
-        ".java", ".kt", ".xml", ".gradle",
-    },
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".kt", ".swift",
+    ".go", ".rs", ".rb", ".php", ".cs", ".cpp", ".c", ".h",
+    ".json", ".yaml", ".yml", ".toml",
+    ".md", ".mdx", ".txt",
+    ".html", ".css", ".scss", ".vue", ".svelte",
 }
 
-ALL_EXTENSIONS = set().union(*INGEST_EXTENSIONS.values())
-
-# Always skip
 DEFAULT_IGNORE = [
     "node_modules/**", ".git/**", "dist/**", "build/**", ".next/**",
     "*.min.js", "*.min.css", "*.map", "*.lock", "*.log",
@@ -44,6 +27,7 @@ DEFAULT_IGNORE = [
 ]
 
 MAX_FILE_SIZE_BYTES = settings.MAX_FILE_SIZE_KB * 1024
+MAX_FILES = 150  # hard cap to prevent runaway ingestion
 
 
 @dataclass
@@ -61,16 +45,23 @@ def get_language(path: str) -> str:
     lang_map = {
         ".py": "python", ".js": "javascript", ".ts": "typescript",
         ".jsx": "javascript", ".tsx": "typescript", ".java": "java",
-        ".kt": "kotlin", ".swift": "swift", ".go": "go", ".rs": "rust",
-        ".rb": "ruby", ".php": "php", ".cs": "csharp", ".cpp": "cpp",
-        ".md": "markdown", ".mdx": "markdown", ".yaml": "yaml", ".yml": "yaml",
-        ".json": "json", ".html": "html", ".css": "css", ".xml": "xml",
+        ".kt": "kotlin", ".go": "go", ".rs": "rust", ".rb": "ruby",
+        ".md": "markdown", ".yaml": "yaml", ".yml": "yaml",
+        ".json": "json", ".html": "html", ".css": "css",
     }
     return lang_map.get(ext, "text")
 
 
+def should_ignore(path: str, ignore_patterns: list[str]) -> bool:
+    for pattern in ignore_patterns:
+        if fnmatch.fnmatch(path, pattern):
+            return True
+        if fnmatch.fnmatch(os.path.basename(path), pattern):
+            return True
+    return False
+
+
 def load_cortexignore(repo, branch: str) -> list[str]:
-    """Load .cortexignore patterns from repo root."""
     try:
         content = repo.get_contents(".cortexignore", ref=branch)
         patterns = content.decoded_content.decode("utf-8").splitlines()
@@ -79,88 +70,73 @@ def load_cortexignore(repo, branch: str) -> list[str]:
         return []
 
 
-def should_ignore(path: str, ignore_patterns: list[str]) -> bool:
-    for pattern in ignore_patterns:
-        if fnmatch.fnmatch(path, pattern):
-            return True
-        # Also match against filename only
-        if fnmatch.fnmatch(os.path.basename(path), pattern):
-            return True
-    return False
-
-
 def ingest_github_repo(
     repo_url: str,
     github_token: str,
     branch: str = "main",
     changed_files: list[str] | None = None,
 ) -> Iterator[IngestedFile]:
-    """
-    Ingest files from a GitHub repo.
-    If changed_files is provided, only ingest those (incremental mode).
-    """
-    g = Github(github_token)
+    g = Github(github_token, timeout=30)
     repo_name = repo_url.rstrip("/").replace("https://github.com/", "")
     repo = g.get_repo(repo_name)
 
     log.info("github.ingest.start", repo=repo_name, branch=branch)
 
-    # Build ignore list
     ignore_patterns = DEFAULT_IGNORE + load_cortexignore(repo, branch)
+    file_count = 0
 
-    def walk_tree(tree_sha: str, prefix: str = "") -> Iterator[IngestedFile]:
-        tree = repo.get_git_tree(tree_sha)
+    try:
+        # Use get_git_tree with recursive=True — single API call instead of tree walking
+        try:
+            commit = repo.get_branch(branch).commit
+        except GithubException:
+            commit = repo.get_branch("master").commit
+
+        tree = repo.get_git_tree(commit.commit.tree.sha, recursive=True)
+
         for item in tree.tree:
-            full_path = f"{prefix}{item.path}" if prefix else item.path
+            if file_count >= MAX_FILES:
+                log.warning("github.ingest.max_files_reached", limit=MAX_FILES)
+                break
+
+            if item.type != "blob":
+                continue
+
+            full_path = item.path
 
             if should_ignore(full_path, ignore_patterns):
                 continue
 
-            if item.type == "tree":
-                yield from walk_tree(item.sha, f"{full_path}/")
+            ext = os.path.splitext(full_path)[1].lower()
+            if ext not in INGEST_EXTENSIONS:
+                continue
 
-            elif item.type == "blob":
-                ext = os.path.splitext(full_path)[1].lower()
-                filename = os.path.basename(full_path).lower()
+            if item.size and item.size > MAX_FILE_SIZE_BYTES:
+                log.debug("github.ingest.skip_large", path=full_path, size=item.size)
+                continue
 
-                if ext not in ALL_EXTENSIONS and filename not in ["dockerfile", "makefile", "procfile"]:
-                    continue
+            if changed_files and full_path not in changed_files:
+                continue
 
-                if item.size and item.size > MAX_FILE_SIZE_BYTES:
-                    log.debug("github.ingest.skip_large", path=full_path, size=item.size)
-                    continue
+            try:
+                blob = repo.get_git_blob(item.sha)
+                content_bytes = base64.b64decode(blob.content)
+                content = content_bytes.decode("utf-8", errors="replace")
 
-                # If incremental, only process changed files
-                if changed_files and full_path not in changed_files:
-                    continue
+                yield IngestedFile(
+                    path=full_path,
+                    content=content,
+                    language=get_language(full_path),
+                    size_bytes=len(content_bytes),
+                    last_modified="",
+                )
+                file_count += 1
+            except Exception as e:
+                log.warning("github.ingest.file_error", path=full_path, error=str(e)[:100])
+                continue
 
-                try:
-                    blob = repo.get_git_blob(item.sha)
-                    content_bytes = base64.b64decode(blob.content)
-                    content = content_bytes.decode("utf-8", errors="replace")
+    except GithubException as e:
+        log.error("github.ingest.error", error=str(e))
+        raise
 
-                    yield IngestedFile(
-                        path=full_path,
-                        content=content,
-                        language=get_language(full_path),
-                        size_bytes=len(content_bytes),
-                        last_modified="",  # set from commits if needed
-                    )
-                except Exception as e:
-                    log.warning("github.ingest.file_error", path=full_path, error=str(e))
-                    continue
-
-    # Get default branch tree
-    try:
-        commit = repo.get_branch(branch).commit
-        yield from walk_tree(commit.commit.tree.sha)
-    except GithubException:
-        # Try main → master fallback
-        try:
-            commit = repo.get_branch("master").commit
-            yield from walk_tree(commit.commit.tree.sha)
-        except GithubException as e:
-            log.error("github.ingest.branch_error", error=str(e))
-            raise
-
-    log.info("github.ingest.complete", repo=repo_name)
+    log.info("github.ingest.complete", repo=repo_name, file_count=file_count)
