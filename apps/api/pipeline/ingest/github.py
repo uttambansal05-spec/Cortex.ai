@@ -26,8 +26,8 @@ DEFAULT_IGNORE = [
     "coverage/**", ".nyc_output/**",
 ]
 
-MAX_FILE_SIZE_BYTES = settings.MAX_FILE_SIZE_KB * 1024
-MAX_FILES = 150  # hard cap to prevent runaway ingestion
+MAX_FILE_SIZE_BYTES = 100 * 1024  # 100KB
+MAX_FILES = 150
 
 
 @dataclass
@@ -61,78 +61,66 @@ def should_ignore(path: str, ignore_patterns: list[str]) -> bool:
     return False
 
 
-def load_cortexignore(repo, branch: str) -> list[str]:
-    try:
-        content = repo.get_contents(".cortexignore", ref=branch)
-        patterns = content.decoded_content.decode("utf-8").splitlines()
-        return [p.strip() for p in patterns if p.strip() and not p.startswith("#")]
-    except GithubException:
-        return []
-
-
 def ingest_github_repo(
     repo_url: str,
     github_token: str,
     branch: str = "main",
     changed_files: list[str] | None = None,
 ) -> Iterator[IngestedFile]:
-    g = Github(github_token, timeout=30)
+    g = Github(github_token, timeout=30, retry=3)
     repo_name = repo_url.rstrip("/").replace("https://github.com/", "")
     repo = g.get_repo(repo_name)
 
     log.info("github.ingest.start", repo=repo_name, branch=branch)
 
-    ignore_patterns = DEFAULT_IGNORE + load_cortexignore(repo, branch)
     file_count = 0
 
     try:
-        # Use get_git_tree with recursive=True — single API call instead of tree walking
         try:
             commit = repo.get_branch(branch).commit
         except GithubException:
             commit = repo.get_branch("master").commit
 
         tree = repo.get_git_tree(commit.commit.tree.sha, recursive=True)
+        items = [i for i in tree.tree if i.type == "blob"]
+        log.info("github.ingest.tree_fetched", total_blobs=len(items))
 
-        for item in tree.tree:
+        for item in items:
             if file_count >= MAX_FILES:
                 log.warning("github.ingest.max_files_reached", limit=MAX_FILES)
                 break
 
-            if item.type != "blob":
-                continue
-
             full_path = item.path
-
-            if should_ignore(full_path, ignore_patterns):
-                continue
-
             ext = os.path.splitext(full_path)[1].lower()
+
+            if should_ignore(full_path, DEFAULT_IGNORE):
+                continue
             if ext not in INGEST_EXTENSIONS:
                 continue
-
             if item.size and item.size > MAX_FILE_SIZE_BYTES:
                 log.debug("github.ingest.skip_large", path=full_path, size=item.size)
                 continue
-
             if changed_files and full_path not in changed_files:
                 continue
 
             try:
-                blob = repo.get_git_blob(item.sha)
-                content_bytes = base64.b64decode(blob.content)
-                content = content_bytes.decode("utf-8", errors="replace")
-
+                # Use contents API instead of blob API — faster and more reliable
+                file_content = repo.get_contents(full_path, ref=commit.sha)
+                if isinstance(file_content, list):
+                    continue
+                content = file_content.decoded_content.decode("utf-8", errors="replace")
                 yield IngestedFile(
                     path=full_path,
                     content=content,
                     language=get_language(full_path),
-                    size_bytes=len(content_bytes),
+                    size_bytes=len(content),
                     last_modified="",
                 )
                 file_count += 1
+                if file_count % 20 == 0:
+                    log.info("github.ingest.progress", files_done=file_count)
             except Exception as e:
-                log.warning("github.ingest.file_error", path=full_path, error=str(e)[:100])
+                log.warning("github.ingest.file_error", path=full_path, error=str(e)[:80])
                 continue
 
     except GithubException as e:
