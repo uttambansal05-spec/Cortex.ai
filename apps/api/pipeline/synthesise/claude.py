@@ -6,13 +6,16 @@ import structlog
 log = structlog.get_logger()
 _client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-SYNTHESISE_PROMPT = """Build a knowledge graph from these code extractions.
+SYNTHESISE_PROMPT = """You are building a knowledge graph for a product codebase.
+
+Analyse these code extractions and synthesise ALL entities, decisions, risks, gaps, dependencies and flows you can find.
+Be thorough — extract as many meaningful nodes as possible.
 
 {extractions_json}
 
 Return ONLY valid JSON:
 {{
-  "entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": []}}],
+  "entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": [], "dependencies": []}}],
   "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}],
   "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}],
   "gaps": [{{"label": "Gap", "detail": "What is missing"}}],
@@ -24,7 +27,9 @@ Return ONLY valid JSON:
     "tech_stack": [],
     "architecture_pattern": "monolith|microservices|serverless|hybrid"
   }}
-}}"""
+}}
+
+Important: Extract EVERY meaningful entity, risk, gap and decision. Do not skip anything."""
 
 
 def _clean_json(text: str) -> dict:
@@ -89,17 +94,18 @@ async def synthesise_extractions(extractions: list[dict]) -> dict:
         log.info("claude.synthesise.batch", batch=i+1, total=len(batches))
         payload = json.dumps({"files": batch}, indent=1)
 
-        if len(payload) > 80000:
-            payload = json.dumps({"files": batch}, separators=(',', ':'))
-
         try:
             message = _client.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=4096,
+                max_tokens=8192,
                 timeout=90,
                 messages=[{"role": "user", "content": SYNTHESISE_PROMPT.format(extractions_json=payload)}]
             )
             result = _clean_json(message.content[0].text)
+            log.info("claude.synthesise.batch_result",
+                     batch=i+1,
+                     entities=len(result.get("entities", [])),
+                     risks=len(result.get("risks", [])))
             partials.append(result if result else _empty_graph())
         except Exception as e:
             log.error("claude.synthesise.batch_failed", batch=i+1, error=str(e)[:200])
