@@ -92,7 +92,7 @@ async def synthesise_extractions(extractions: list[dict]) -> dict:
 
     for i, batch in enumerate(batches):
         log.info("claude.synthesise.batch", batch=i+1, total=len(batches))
-        payload = json.dumps({"files": batch}, indent=1)
+        payload = json.dumps(batch, indent=1)
 
         try:
             message = _client.messages.create(
