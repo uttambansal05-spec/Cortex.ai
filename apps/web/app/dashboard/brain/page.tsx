@@ -78,7 +78,7 @@ export default function BrainMapPage() {
         .from('projects').select('id, name').eq('workspace_id', workspace.id)
       if (projs?.length) {
         setProjects(projs)
-        setSelectedProject(projs[0].id)
+        const projectParam = searchParams?.get('project'); const match = projectParam && projs.find((p: any) => p.id === projectParam); setSelectedProject(match ? match.id : projs[0].id)
       }
     }
     load()

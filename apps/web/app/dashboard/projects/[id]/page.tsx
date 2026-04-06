@@ -3,150 +3,192 @@
 import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter, useParams } from 'next/navigation'
-import { Brain, GitBranch, Loader2, RefreshCw, ArrowLeft, AlertTriangle } from 'lucide-react'
 import Link from 'next/link'
+import { Brain, RefreshCw, Search, GitGraph, ArrowLeft, AlertCircle, Clock } from 'lucide-react'
 
 export default function ProjectPage() {
   const [project, setProject] = useState<any>(null)
   const [snapshot, setSnapshot] = useState<any>(null)
-  const [loading, setLoading] = useState(true)
   const [building, setBuilding] = useState(false)
-  const [session, setSession] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
   const router = useRouter()
   const params = useParams()
-  const projectId = params.id as string
+  const id = params.id as string
   const supabase = createClient()
 
   useEffect(() => {
     const load = async () => {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) { router.replace('/auth/login'); return }
-      setSession(session)
-      const { data: proj } = await supabase.from('projects').select('*').eq('id', projectId).single()
+
+      const { data: proj } = await supabase
+        .from('projects').select('*').eq('id', id).single()
       if (!proj) { router.replace('/dashboard'); return }
       setProject(proj)
-      const { data: snaps } = await supabase.from('brain_snapshots').select('*').eq('project_id', projectId).order('created_at', { ascending: false }).limit(1)
-      if (snaps?.length) setSnapshot(snaps[0])
+
+      await loadSnapshot(id)
       setLoading(false)
+
+      // Realtime subscription
+      const channel = supabase.channel(`snapshot-${id}`)
+        .on('postgres_changes', {
+          event: '*', schema: 'public', table: 'brain_snapshots',
+          filter: `project_id=eq.${id}`,
+        }, () => loadSnapshot(id))
+        .subscribe()
+      return () => { supabase.removeChannel(channel) }
     }
     load()
-    const channel = supabase.channel(`brain-${projectId}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'brain_snapshots', filter: `project_id=eq.${projectId}` },
-        (payload) => { setSnapshot(payload.new); if (['complete','failed'].includes(payload.new.status)) setBuilding(false) })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'brain_snapshots', filter: `project_id=eq.${projectId}` },
-        (payload) => setSnapshot(payload.new))
-      .subscribe()
-    return () => { supabase.removeChannel(channel) }
-  }, [projectId])
+  }, [id])
 
-  const handleBuild = async () => {
-    if (!session) return
-    setBuilding(true)
-    const res = await fetch(`/api/brain/${projectId}/build`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
-      body: JSON.stringify({ trigger: 'manual', incremental: false }),
-    })
-    if (!res.ok) { setBuilding(false); const err = await res.json(); alert(err.error || 'Build failed') }
+  const loadSnapshot = async (projectId: string) => {
+    const { data } = await supabase
+      .from('brain_snapshots')
+      .select('*')
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single()
+    setSnapshot(data)
+    if (data?.status === 'building') setBuilding(true)
+    else setBuilding(false)
   }
 
-  if (loading) return <div className="flex items-center justify-center h-screen"><Brain className="w-4 h-4 text-accent animate-pulse" /></div>
+  const handleBuild = async () => {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) return
+    setBuilding(true)
+    await fetch(`/api/brain/${id}/build`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${session.access_token}` },
+    })
+  }
 
-  const isBuilding = building || ['building','pending'].includes(snapshot?.status)
-  const metadata = snapshot?.metadata || {}
-  const staleness = snapshot?.staleness_score || 0
+  if (loading) return (
+    <div className="flex items-center justify-center h-full">
+      <Brain className="w-4 h-4 text-accent animate-pulse" />
+    </div>
+  )
+
+  const meta = snapshot?.metadata || {}
+  const isComplete = snapshot?.status === 'complete'
+  const isFailed = snapshot?.status === 'failed'
+  const byType = meta.by_type || {}
+  const productSummary = meta.product_summary || {}
+  const techStack = productSummary.tech_stack || []
 
   return (
-    <div className="p-8 max-w-5xl mx-auto space-y-6">
-      <div className="flex items-start justify-between">
-        <div>
-          <Link href="/dashboard" className="btn-ghost mb-3 -ml-1 inline-flex"><ArrowLeft className="w-3.5 h-3.5" />Projects</Link>
+    <div className="p-8 max-w-3xl mx-auto">
+      {/* Header */}
+      <div className="flex items-center gap-3 mb-8">
+        <Link href="/dashboard" className="text-foreground-2 hover:text-foreground transition-colors">
+          <ArrowLeft className="w-4 h-4" />
+        </Link>
+        <div className="flex-1">
           <h1 className="text-base font-medium text-foreground">{project?.name}</h1>
-          {project?.github_repo_url && (
-            <a href={project.github_repo_url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 mt-1 text-2xs text-muted hover:text-foreground-2 font-mono">
-              <GitBranch className="w-3 h-3" />{project.github_repo_url.replace('https://github.com/', '')}
-            </a>
-          )}
+          <p className="text-xs text-foreground-2 mt-0.5">{project?.github_repo_url?.replace('https://github.com/', '')}</p>
         </div>
-        <button onClick={handleBuild} disabled={isBuilding} className="btn-primary">
-          {isBuilding ? <><Loader2 className="w-3.5 h-3.5 animate-spin" />Building…</> :
-           snapshot ? <><RefreshCw className="w-3.5 h-3.5" />Rebuild Brain</> :
-           <><Brain className="w-3.5 h-3.5" />Build Brain</>}
+        <button
+          onClick={handleBuild}
+          disabled={building}
+          className="btn-primary flex items-center gap-2"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${building ? 'animate-spin' : ''}`} />
+          {building ? 'Building…' : isComplete ? 'Rebuild Brain' : 'Build Brain'}
         </button>
       </div>
-      <div className="card p-5 space-y-4">
-        {!snapshot ? (
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-surface-2 border border-border flex items-center justify-center">
-              <Brain className="w-4 h-4 text-muted" />
-            </div>
-            <div>
-              <p className="text-sm text-foreground">No Brain built yet</p>
-              <p className="text-xs text-foreground-2 mt-0.5">Click "Build Brain" to start ingesting the codebase.</p>
-            </div>
+
+      {/* Brain status card */}
+      <div className="card p-5 mb-6">
+        <div className="flex items-center gap-3 mb-4">
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${isComplete ? 'bg-accent/10 border border-accent/20' : 'bg-surface-2 border border-border'}`}>
+            <Brain className={`w-4 h-4 ${isComplete ? 'text-accent' : 'text-muted'}`} />
           </div>
-        ) : (
-          <>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${snapshot.status === 'complete' ? 'bg-success/10' : snapshot.status === 'failed' ? 'bg-danger/10' : 'bg-accent/10'}`}>
-                  {isBuilding ? <Loader2 className="w-4 h-4 text-accent animate-spin" /> : <Brain className={`w-4 h-4 ${snapshot.status === 'complete' ? 'text-success' : 'text-danger'}`} />}
-                </div>
-                <div>
-                  <p className="text-sm font-medium text-foreground">
-                    {isBuilding ? 'Building Brain…' : snapshot.status === 'complete' ? 'Brain active' : snapshot.status === 'failed' ? 'Build failed' : snapshot.status}
-                  </p>
-                  <p className="text-2xs text-foreground-2 mt-0.5">v{snapshot.version}{snapshot.built_at && ` · Built ${new Date(snapshot.built_at).toLocaleDateString()}`}</p>
-                </div>
-              </div>
-              {snapshot.status === 'complete' && staleness > 0 && (
-                <div className="flex items-center gap-1.5">
-                  <AlertTriangle className={`w-3.5 h-3.5 ${staleness >= 0.5 ? 'text-danger' : 'text-warning'}`} />
-                  <span className={`text-xs ${staleness >= 0.5 ? 'text-danger' : 'text-warning'}`}>{Math.round(staleness * 100)}% stale</span>
-                </div>
-              )}
-            </div>
-            {isBuilding && (
-              <div className="space-y-1.5">
-                <div className="h-0.5 bg-surface-3 rounded-full overflow-hidden">
-                  <div className="h-full bg-accent rounded-full animate-brain-build" style={{ width: '60%' }} />
-                </div>
-                <p className="text-2xs text-muted">Ingesting codebase → extracting entities → synthesising graph · ~2–5 min</p>
-              </div>
+          <div>
+            <p className="text-sm font-medium text-foreground">
+              {building ? 'Building Brain…' : isComplete ? 'Brain active' : isFailed ? 'Build failed' : 'No brain yet'}
+            </p>
+            {snapshot?.version && (
+              <p className="text-xs text-foreground-2">
+                v{snapshot.version}
+                {snapshot.built_at && ` · Built ${new Date(snapshot.built_at).toLocaleDateString()}`}
+              </p>
             )}
-            {snapshot.status === 'failed' && metadata.error && (
-              <div className="bg-danger/5 border border-danger/20 rounded px-3 py-2">
-                <p className="text-2xs text-danger font-mono">{metadata.error}</p>
+          </div>
+        </div>
+
+        {isFailed && (
+          <div className="flex items-center gap-2 p-3 bg-danger/5 border border-danger/20 rounded-lg mb-4">
+            <AlertCircle className="w-3.5 h-3.5 text-danger flex-shrink-0" />
+            <p className="text-xs text-danger">{meta?.error || 'Build failed'}</p>
+          </div>
+        )}
+
+        {building && (
+          <div className="flex items-center gap-2 p-3 bg-accent/5 border border-accent/20 rounded-lg mb-4">
+            <Clock className="w-3.5 h-3.5 text-accent flex-shrink-0 animate-pulse" />
+            <p className="text-xs text-accent">Building knowledge graph — this takes 5-15 minutes</p>
+          </div>
+        )}
+
+        {/* Node counts */}
+        {isComplete && Object.keys(byType).length > 0 && (
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            {Object.entries(byType).map(([type, count]) => (
+              <div key={type} className="bg-surface-2 rounded-lg p-3">
+                <p className="text-lg font-medium text-foreground">{count as number}</p>
+                <p className="text-xs text-foreground-2 capitalize">{type}</p>
               </div>
+            ))}
+          </div>
+        )}
+
+        {/* Product summary */}
+        {isComplete && productSummary.what_it_does && (
+          <p className="text-xs text-foreground-2 leading-relaxed mb-3">
+            {productSummary.what_it_does}
+          </p>
+        )}
+
+        {/* Tech stack */}
+        {isComplete && techStack.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {techStack.map((t: string) => (
+              <span key={t} className="badge-muted">{t}</span>
+            ))}
+            {productSummary.architecture_pattern && (
+              <span className="badge-accent">{productSummary.architecture_pattern}</span>
             )}
-            {snapshot.status === 'complete' && metadata.total_nodes && (
-              <div className="flex items-center gap-4 pt-1 border-t border-border">
-                <span className="text-2xs text-foreground-2"><span className="text-foreground font-medium">{metadata.total_nodes}</span> nodes</span>
-                {metadata.product_summary?.architecture_pattern && <span className="badge-muted">{metadata.product_summary.architecture_pattern}</span>}
-              </div>
-            )}
-          </>
+          </div>
         )}
       </div>
-      {snapshot?.status === 'complete' && metadata.product_summary?.what_it_does && (
-        <div className="card p-5">
-          <h3 className="label mb-2">Brain Summary</h3>
-          <p className="text-sm text-foreground-2 leading-relaxed">{metadata.product_summary.what_it_does}</p>
-          {metadata.product_summary.tech_stack?.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 mt-3">
-              {metadata.product_summary.tech_stack.map((t: string) => <span key={t} className="badge-muted">{t}</span>)}
+
+      {/* Action cards — Query Brain + Brain Map */}
+      {isComplete && (
+        <div className="grid grid-cols-2 gap-4">
+          <Link href={`/dashboard/query?project=${id}`} className="card p-5 hover:border-border-2 transition-colors group block">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center">
+                <Search className="w-4 h-4 text-accent" />
+              </div>
+              <p className="text-sm font-medium text-foreground">Query Brain</p>
             </div>
-          )}
-        </div>
-      )}
-      {snapshot?.status === 'complete' && metadata.by_type && (
-        <div className="grid grid-cols-4 gap-3">
-          {Object.entries(metadata.by_type).map(([type, count]) => (
-            <div key={type} className="card p-4">
-              <div className={`node-${type} mb-2 w-fit`}>{type}</div>
-              <div className="text-xl font-medium text-foreground">{count as number}</div>
+            <p className="text-xs text-foreground-2 leading-relaxed">
+              Ask questions about the codebase in plain English. Get answers grounded in the knowledge graph.
+            </p>
+          </Link>
+
+          <Link href={`/dashboard/brain?project=${id}`} className="card p-5 hover:border-border-2 transition-colors group block">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 rounded-lg bg-surface-2 border border-border flex items-center justify-center">
+                <GitGraph className="w-4 h-4 text-foreground-2 group-hover:text-accent transition-colors" />
+              </div>
+              <p className="text-sm font-medium text-foreground">Brain Map</p>
             </div>
-          ))}
+            <p className="text-xs text-foreground-2 leading-relaxed">
+              Visualise the knowledge graph. Explore nodes, edges, and communities interactively.
+            </p>
+          </Link>
         </div>
       )}
     </div>

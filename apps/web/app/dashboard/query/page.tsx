@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { Brain, Send, Loader2, AlertTriangle, FileCode } from 'lucide-react'
 
 interface Message {
@@ -30,6 +30,7 @@ export default function QueryPage() {
   const [session, setSession] = useState<any>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const router = useRouter()
+  const searchParams = useSearchParams()
   const supabase = createClient()
 
   useEffect(() => {
@@ -46,7 +47,9 @@ export default function QueryPage() {
         .from('projects').select('id, name').eq('workspace_id', workspace.id)
       if (projs?.length) {
         setProjects(projs)
-        setSelectedProject(projs[0].id)
+        const projectParam = searchParams.get('project')
+        const match = projectParam && projs.find(p => p.id === projectParam)
+        setSelectedProject(match ? match.id : projs[0].id)
       }
     }
     load()
@@ -59,41 +62,23 @@ export default function QueryPage() {
   const handleSend = async (question?: string) => {
     const q = question || input.trim()
     if (!q || !selectedProject || loading) return
-
     setInput('')
     setMessages(prev => [...prev, { role: 'user', content: q }])
     setLoading(true)
-
     try {
       const res = await fetch('/api/agents/query', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session?.access_token}`,
-        },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session?.access_token}` },
         body: JSON.stringify({ project_id: selectedProject, question: q }),
       })
-
       const data = await res.json()
-
       if (!res.ok) {
-        setMessages(prev => [...prev, {
-          role: 'assistant',
-          content: data.detail || data.error || 'Something went wrong.',
-        }])
+        setMessages(prev => [...prev, { role: 'assistant', content: data.detail || data.error || 'Something went wrong.' }])
       } else {
-        setMessages(prev => [...prev, {
-          role: 'assistant',
-          content: data.answer,
-          sources: data.source_nodes,
-          staleness_warning: data.staleness_warning,
-        }])
+        setMessages(prev => [...prev, { role: 'assistant', content: data.answer, sources: data.source_nodes, staleness_warning: data.staleness_warning }])
       }
-    } catch (e) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: 'Failed to reach the Brain. Make sure the API is awake.',
-      }])
+    } catch {
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to reach the Brain.' }])
     } finally {
       setLoading(false)
     }
@@ -101,26 +86,18 @@ export default function QueryPage() {
 
   return (
     <div className="flex flex-col h-screen">
-      {/* Header */}
       <div className="flex items-center justify-between px-8 py-4 border-b border-border flex-shrink-0">
         <div className="flex items-center gap-3">
           <Brain className="w-4 h-4 text-accent" />
           <h1 className="text-sm font-medium text-foreground">Query Brain</h1>
         </div>
         {projects.length > 1 && (
-          <select
-            value={selectedProject}
-            onChange={e => setSelectedProject(e.target.value)}
-            className="input w-48 text-xs"
-          >
-            {projects.map(p => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
+          <select value={selectedProject} onChange={e => setSelectedProject(e.target.value)} className="input w-48 text-xs">
+            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
         )}
       </div>
 
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto px-8 py-6 space-y-6">
         {messages.length === 0 ? (
           <div className="max-w-2xl mx-auto">
@@ -129,17 +106,11 @@ export default function QueryPage() {
                 <Brain className="w-5 h-5 text-accent" />
               </div>
               <h2 className="text-sm font-medium text-foreground mb-1">Ask the Brain</h2>
-              <p className="text-xs text-foreground-2">
-                Ask anything about your codebase. The Brain answers from your knowledge graph.
-              </p>
+              <p className="text-xs text-foreground-2">Ask anything about your codebase. The Brain answers from your knowledge graph.</p>
             </div>
             <div className="grid grid-cols-2 gap-2">
               {SUGGESTED.map(q => (
-                <button
-                  key={q}
-                  onClick={() => handleSend(q)}
-                  className="card p-3 text-left text-xs text-foreground-2 hover:text-foreground hover:border-border-2 transition-colors"
-                >
+                <button key={q} onClick={() => handleSend(q)} className="card p-3 text-left text-xs text-foreground-2 hover:text-foreground hover:border-border-2 transition-colors">
                   {q}
                 </button>
               ))}
@@ -149,7 +120,7 @@ export default function QueryPage() {
           <div className="max-w-2xl mx-auto space-y-6">
             {messages.map((msg, i) => (
               <div key={i} className={msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
-                <div className={`max-w-[85%] ${msg.role === 'user' ? 'order-2' : 'order-1'}`}>
+                <div className="max-w-[85%]">
                   {msg.role === 'user' ? (
                     <div className="bg-accent/10 border border-accent/20 rounded-lg px-4 py-3">
                       <p className="text-sm text-foreground">{msg.content}</p>
@@ -157,26 +128,25 @@ export default function QueryPage() {
                   ) : (
                     <div className="space-y-3">
                       {msg.staleness_warning && (
-                        <div className="flex items-center gap-2 text-2xs text-warning">
-                          <AlertTriangle className="w-3 h-3 flex-shrink-0" />
-                          {msg.staleness_warning}
+                        <div className="flex items-center gap-2 text-xs text-warning">
+                          <AlertTriangle className="w-3 h-3 flex-shrink-0" />{msg.staleness_warning}
                         </div>
                       )}
                       <div className="card p-4">
                         <div className="flex items-center gap-2 mb-3">
                           <Brain className="w-3.5 h-3.5 text-accent flex-shrink-0" />
-                          <span className="text-2xs text-accent font-medium uppercase tracking-wider">Brain</span>
+                          <span className="text-xs text-accent font-medium uppercase tracking-wider">Brain</span>
                         </div>
                         <p className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">{msg.content}</p>
                       </div>
                       {msg.sources && msg.sources.length > 0 && (
                         <div className="space-y-1">
-                          <p className="text-2xs text-muted uppercase tracking-wider">Sources</p>
+                          <p className="text-xs text-muted uppercase tracking-wider">Sources</p>
                           <div className="flex flex-wrap gap-1.5">
                             {msg.sources.slice(0, 6).map((s, j) => (
-                              <div key={j} className={`node-${s.type} flex items-center gap-1`}>
+                              <div key={j} className="flex items-center gap-1 badge-muted">
                                 {s.source_file && <FileCode className="w-2.5 h-2.5" />}
-                                {s.label}
+                                <span className="text-xs">{s.label}</span>
                               </div>
                             ))}
                           </div>
@@ -200,23 +170,16 @@ export default function QueryPage() {
         )}
       </div>
 
-      {/* Input */}
       <div className="px-8 py-4 border-t border-border flex-shrink-0">
         <div className="max-w-2xl mx-auto flex gap-2">
           <input
-            type="text"
-            className="input flex-1"
+            type="text" className="input flex-1"
             placeholder="Ask anything about your codebase…"
-            value={input}
-            onChange={e => setInput(e.target.value)}
+            value={input} onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
             disabled={loading}
           />
-          <button
-            onClick={() => handleSend()}
-            disabled={loading || !input.trim() || !selectedProject}
-            className="btn-primary px-3"
-          >
+          <button onClick={() => handleSend()} disabled={loading || !input.trim() || !selectedProject} className="btn-primary px-3">
             {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
           </button>
         </div>
