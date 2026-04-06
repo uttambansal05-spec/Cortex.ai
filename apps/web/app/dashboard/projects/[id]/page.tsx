@@ -29,7 +29,6 @@ export default function ProjectPage() {
       await loadSnapshot(id)
       setLoading(false)
 
-      // Realtime subscription
       const channel = supabase.channel(`snapshot-${id}`)
         .on('postgres_changes', {
           event: '*', schema: 'public', table: 'brain_snapshots',
@@ -48,9 +47,8 @@ export default function ProjectPage() {
       .eq('project_id', projectId)
       .order('created_at', { ascending: false })
       .limit(1)
-      .single()
-    setSnapshot(data)
-    if (data?.status === 'building') setBuilding(true)
+    setSnapshot(data?.[0] || null)
+    if (data?.[0]?.status === 'building') setBuilding(true)
     else setBuilding(false)
   }
 
@@ -58,10 +56,20 @@ export default function ProjectPage() {
     const { data: { session } } = await supabase.auth.getSession()
     if (!session) return
     setBuilding(true)
-    await fetch(`/api/brain/${id}/build`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${session.access_token}` },
-    })
+    try {
+      const res = await fetch(`/api/brain/${id}/build`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${session.access_token}` },
+      })
+      if (!res.ok) {
+        const err = await res.text()
+        console.error('Build failed:', err)
+        setBuilding(false)
+      }
+    } catch (e) {
+      console.error('Build error:', e)
+      setBuilding(false)
+    }
   }
 
   if (loading) return (
@@ -79,7 +87,6 @@ export default function ProjectPage() {
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
-      {/* Header */}
       <div className="flex items-center gap-3 mb-8">
         <Link href="/dashboard" className="text-foreground-2 hover:text-foreground transition-colors">
           <ArrowLeft className="w-4 h-4" />
@@ -98,7 +105,6 @@ export default function ProjectPage() {
         </button>
       </div>
 
-      {/* Brain status card */}
       <div className="card p-5 mb-6">
         <div className="flex items-center gap-3 mb-4">
           <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${isComplete ? 'bg-accent/10 border border-accent/20' : 'bg-surface-2 border border-border'}`}>
@@ -131,7 +137,6 @@ export default function ProjectPage() {
           </div>
         )}
 
-        {/* Node counts */}
         {isComplete && Object.keys(byType).length > 0 && (
           <div className="grid grid-cols-3 gap-3 mb-4">
             {Object.entries(byType).map(([type, count]) => (
@@ -143,14 +148,10 @@ export default function ProjectPage() {
           </div>
         )}
 
-        {/* Product summary */}
         {isComplete && productSummary.what_it_does && (
-          <p className="text-xs text-foreground-2 leading-relaxed mb-3">
-            {productSummary.what_it_does}
-          </p>
+          <p className="text-xs text-foreground-2 leading-relaxed mb-3">{productSummary.what_it_does}</p>
         )}
 
-        {/* Tech stack */}
         {isComplete && techStack.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {techStack.map((t: string) => (
@@ -163,7 +164,6 @@ export default function ProjectPage() {
         )}
       </div>
 
-      {/* Action cards — Query Brain + Brain Map */}
       {isComplete && (
         <div className="grid grid-cols-2 gap-4">
           <Link href={`/dashboard/query?project=${id}`} className="card p-5 hover:border-border-2 transition-colors group block">
@@ -186,7 +186,7 @@ export default function ProjectPage() {
               <p className="text-sm font-medium text-foreground">Brain Map</p>
             </div>
             <p className="text-xs text-foreground-2 leading-relaxed">
-              Visualise the knowledge graph. Explore nodes, edges, and communities interactively.
+              Visualise the knowledge graph. Explore nodes, edges and communities interactively.
             </p>
           </Link>
         </div>
