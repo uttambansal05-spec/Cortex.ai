@@ -6,30 +6,16 @@ import structlog
 log = structlog.get_logger()
 _client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-SYNTHESISE_PROMPT = """You are building a knowledge graph for a product codebase.
+SYNTHESISE_PROMPT = """You are building a knowledge graph from code extractions.
 
-Analyse these code extractions and synthesise ALL entities, decisions, risks, gaps, dependencies and flows you can find.
-Be thorough — extract as many meaningful nodes as possible.
+Here are the extracted entities, decisions, risks and gaps from {file_count} files:
 
 {extractions_json}
 
-Return ONLY valid JSON:
-{{
-  "entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": [], "dependencies": []}}],
-  "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}],
-  "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}],
-  "gaps": [{{"label": "Gap", "detail": "What is missing"}}],
-  "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}],
-  "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}],
-  "product_summary": {{
-    "what_it_does": "2-3 sentence description",
-    "core_modules": [],
-    "tech_stack": [],
-    "architecture_pattern": "monolith|microservices|serverless|hybrid"
-  }}
-}}
+Synthesise these into a unified knowledge graph. Merge duplicates. Return ONLY valid JSON:
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": [], "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}], "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}], "product_summary": {{"what_it_does": "2-3 sentences", "core_modules": [], "tech_stack": [], "architecture_pattern": "monolith|microservices|serverless|hybrid"}}}}
 
-Important: Extract EVERY meaningful entity, risk, gap and decision. Do not skip anything."""
+Return every entity, risk, gap and decision. Do not skip anything."""
 
 
 def _clean_json(text: str) -> dict:
@@ -40,14 +26,13 @@ def _clean_json(text: str) -> dict:
         return json.loads(text)
     except Exception:
         start = text.find('{')
-        if start == -1:
-            return {}
-        for end in range(len(text), start, -1):
+        end = text.rfind('}')
+        if start != -1 and end != -1:
             try:
-                return json.loads(text[start:end])
+                return json.loads(text[start:end+1])
             except Exception:
-                continue
-        return {}
+                pass
+    return {}
 
 
 def _empty_graph() -> dict:
@@ -68,30 +53,45 @@ def _merge(partials: list[dict]) -> dict:
     return merged
 
 
-def _pre_aggregate(extractions: list[dict]) -> dict:
-    by_file: dict = {}
+def _flatten_extractions(extractions: list[dict]) -> list[dict]:
+    """Convert raw extractions to flat list of items with source file."""
+    flat = []
     for e in extractions:
-        fp = e.get("_source", {}).get("file_path", "unknown")
-        if fp not in by_file:
-            by_file[fp] = {"entities": [], "decisions": [], "risks": [], "gaps": [], "module_summary": ""}
-        for k in ["entities", "decisions", "risks", "gaps"]:
-            by_file[fp][k].extend(e.get(k, []))
-        if e.get("module_summary"):
-            by_file[fp]["module_summary"] = e["module_summary"]
-    return by_file
+        source = e.get("_source", {})
+        file_path = source.get("file_path", "unknown")
+        for entity in e.get("entities", []):
+            entity["source_files"] = [file_path]
+            flat.append({"type": "entity", **entity})
+        for decision in e.get("decisions", []):
+            decision["source_files"] = [file_path]
+            flat.append({"type": "decision", **decision})
+        for risk in e.get("risks", []):
+            risk["source_files"] = [file_path]
+            flat.append({"type": "risk", **risk})
+        for gap in e.get("gaps", []):
+            gap["source_files"] = [file_path]
+            flat.append({"type": "gap", **gap})
+    return flat
 
 
 async def synthesise_extractions(extractions: list[dict]) -> dict:
-    by_file = _pre_aggregate(extractions)
-    files = list(by_file.items())
-    batch_size = 6
-    batches = [dict(files[i:i+batch_size]) for i in range(0, len(files), batch_size)]
+    flat = _flatten_extractions(extractions)
+    
+    log.info("claude.synthesise.start",
+             total_files=len(extractions),
+             total_items=len(flat))
+
+    if not flat:
+        return _empty_graph()
+
+    # Split into batches of 50 items
+    batch_size = 50
+    batches = [flat[i:i+batch_size] for i in range(0, len(flat), batch_size)]
     partials = []
 
-    log.info("claude.synthesise.start", total_files=len(files), total_batches=len(batches))
-
+    total_batches = len(batches)
     for i, batch in enumerate(batches):
-        log.info("claude.synthesise.batch", batch=i+1, total=len(batches))
+        log.info("claude.synthesise.batch", batch=i+1, total=total_batches)
         payload = json.dumps(batch, indent=1)
 
         try:
@@ -99,7 +99,10 @@ async def synthesise_extractions(extractions: list[dict]) -> dict:
                 model="claude-haiku-4-5",
                 max_tokens=8192,
                 timeout=90,
-                messages=[{"role": "user", "content": SYNTHESISE_PROMPT.format(extractions_json=payload)}]
+                messages=[{"role": "user", "content": SYNTHESISE_PROMPT.format(
+                    file_count=len(set(item.get("source_files", ["?"])[0] for item in batch)),
+                    extractions_json=payload
+                )}]
             )
             result = _clean_json(message.content[0].text)
             log.info("claude.synthesise.batch_result",
