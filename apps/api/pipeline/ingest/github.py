@@ -26,7 +26,7 @@ DEFAULT_IGNORE = [
     "coverage/**", ".nyc_output/**",
 ]
 
-MAX_FILE_SIZE_BYTES = 100 * 1024  # 100KB
+MAX_FILE_SIZE_BYTES = 100 * 1024  # 100KB hard cap
 MAX_FILES = 150
 
 
@@ -48,6 +48,7 @@ def get_language(path: str) -> str:
         ".kt": "kotlin", ".go": "go", ".rs": "rust", ".rb": "ruby",
         ".md": "markdown", ".yaml": "yaml", ".yml": "yaml",
         ".json": "json", ".html": "html", ".css": "css",
+        ".scss": "scss", ".vue": "vue", ".svelte": "svelte",
     }
     return lang_map.get(ext, "text")
 
@@ -67,7 +68,7 @@ def ingest_github_repo(
     branch: str = "main",
     changed_files: list[str] | None = None,
 ) -> Iterator[IngestedFile]:
-    g = Github(github_token, timeout=30, retry=3)
+    g = Github(github_token, timeout=30)
     repo_name = repo_url.rstrip("/").replace("https://github.com/", "")
     repo = g.get_repo(repo_name)
 
@@ -77,15 +78,17 @@ def ingest_github_repo(
 
     try:
         try:
-            commit = repo.get_branch(branch).commit
+            branch_obj = repo.get_branch(branch)
         except GithubException:
-            commit = repo.get_branch("master").commit
+            branch_obj = repo.get_branch("master")
 
-        tree = repo.get_git_tree(commit.commit.tree.sha, recursive=True)
-        items = [i for i in tree.tree if i.type == "blob"]
-        log.info("github.ingest.tree_fetched", total_blobs=len(items))
+        sha = branch_obj.commit.commit.tree.sha
+        tree = repo.get_git_tree(sha, recursive=True)
+        
+        all_items = [i for i in tree.tree if i.type == "blob"]
+        log.info("github.ingest.tree_fetched", total_blobs=len(all_items))
 
-        for item in items:
+        for item in all_items:
             if file_count >= MAX_FILES:
                 log.warning("github.ingest.max_files_reached", limit=MAX_FILES)
                 break
@@ -93,32 +96,45 @@ def ingest_github_repo(
             full_path = item.path
             ext = os.path.splitext(full_path)[1].lower()
 
-            if should_ignore(full_path, DEFAULT_IGNORE):
-                continue
+            # Check extension first (fast)
             if ext not in INGEST_EXTENSIONS:
                 continue
+
+            # Check ignore patterns
+            if should_ignore(full_path, DEFAULT_IGNORE):
+                continue
+
+            # Check file size
             if item.size and item.size > MAX_FILE_SIZE_BYTES:
                 log.debug("github.ingest.skip_large", path=full_path, size=item.size)
                 continue
+
+            # Filter for incremental builds
             if changed_files and full_path not in changed_files:
                 continue
 
+            # Fetch actual file content
             try:
-                # Use contents API instead of blob API — faster and more reliable
-                file_content = repo.get_contents(full_path, ref=commit.sha)
-                if isinstance(file_content, list):
-                    continue
-                content = file_content.decoded_content.decode("utf-8", errors="replace")
+                blob = repo.get_git_blob(item.sha)
+                if blob.encoding == "base64":
+                    content_bytes = base64.b64decode(blob.content)
+                else:
+                    content_bytes = blob.content.encode("utf-8")
+                
+                content = content_bytes.decode("utf-8", errors="replace")
+
                 yield IngestedFile(
                     path=full_path,
                     content=content,
                     language=get_language(full_path),
-                    size_bytes=len(content),
+                    size_bytes=len(content_bytes),
                     last_modified="",
                 )
                 file_count += 1
-                if file_count % 20 == 0:
+
+                if file_count % 10 == 0:
                     log.info("github.ingest.progress", files_done=file_count)
+
             except Exception as e:
                 log.warning("github.ingest.file_error", path=full_path, error=str(e)[:80])
                 continue
