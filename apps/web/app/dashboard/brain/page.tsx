@@ -153,7 +153,7 @@ export default function BrainMapPage() {
     const link = g.append('g')
       .selectAll<SVGLineElement, SimLink>('line').data(simLinks).join('line')
       .attr('stroke', d => COLORS[d.source.node_type] || '#888')
-      .attr('stroke-opacity', 0.2).attr('stroke-width', 1)
+      .attr('stroke-opacity', 0.4).attr('stroke-width', 1.5)
 
     const drag = d3.drag<SVGGElement, SimNode>()
       .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y })
