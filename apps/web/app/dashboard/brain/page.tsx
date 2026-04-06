@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { GitGraph, X, FileCode, AlertTriangle, Loader2 } from 'lucide-react'
 
 const COLORS: Record<string, string> = {
@@ -18,41 +18,22 @@ const TYPE_LABELS: Record<string, string> = {
 }
 
 interface BrainNode {
-  id: string
-  label: string
-  node_type: string
-  summary?: string
-  source_file?: string
-  metadata?: any
+  id: string; label: string; node_type: string
+  summary?: string; source_file?: string; metadata?: any
 }
 
 interface BrainEdge {
-  id: string
-  from_node: string
-  to_node: string
-  edge_type: string
-  weight: number
+  id: string; from_node: string; to_node: string
+  edge_type: string; weight: number
 }
 
 interface SimNode extends BrainNode {
-  x?: number
-  y?: number
-  vx?: number
-  vy?: number
-  fx?: number | null
-  fy?: number | null
-  index?: number
+  x?: number; y?: number; vx?: number; vy?: number
+  fx?: number | null; fy?: number | null; index?: number
 }
 
-interface SimLink {
-  source: SimNode
-  target: SimNode
-  edge_type: string
-}
-
-interface SelectedNode extends BrainNode {
-  connections: number
-}
+interface SimLink { source: SimNode; target: SimNode; edge_type: string }
+interface SelectedNode extends BrainNode { connections: number }
 
 export default function BrainMapPage() {
   const [projects, setProjects] = useState<any[]>([])
@@ -65,6 +46,7 @@ export default function BrainMapPage() {
   const svgRef = useRef<SVGSVGElement>(null)
   const simulationRef = useRef<any>(null)
   const router = useRouter()
+  const searchParams = useSearchParams()
   const supabase = createClient()
 
   useEffect(() => {
@@ -78,7 +60,9 @@ export default function BrainMapPage() {
         .from('projects').select('id, name').eq('workspace_id', workspace.id)
       if (projs?.length) {
         setProjects(projs)
-        const projectParam = searchParams?.get('project'); const match = projectParam && projs.find((p: any) => p.id === projectParam); setSelectedProject(match ? match.id : projs[0].id)
+        const projectParam = searchParams.get('project')
+        const match = projectParam && projs.find((p: any) => p.id === projectParam)
+        setSelectedProject(match ? match.id : projs[0].id)
       }
     }
     load()
@@ -93,11 +77,27 @@ export default function BrainMapPage() {
     setLoading(true)
     setSelectedNode(null)
     try {
-      const res = await fetch(`/api/brain/${projectId}/graph`)
-      if (!res.ok) { setNodes([]); setEdges([]); return }
-      const data = await res.json()
-      setNodes(data.nodes || [])
-      setEdges(data.edges || [])
+      const { data: snapshot } = await supabase
+        .from('brain_snapshots')
+        .select('id')
+        .eq('project_id', projectId)
+        .eq('status', 'complete')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single()
+
+      if (!snapshot) { setNodes([]); setEdges([]); return }
+
+      const [{ data: nodesData }, { data: edgesData }] = await Promise.all([
+        supabase.from('brain_nodes')
+          .select('id, label, node_type, summary, source_file')
+          .eq('project_id', projectId),
+        supabase.from('brain_edges')
+          .select('id, from_node, to_node, edge_type, weight')
+          .eq('project_id', projectId),
+      ])
+      setNodes(nodesData || [])
+      setEdges(edgesData || [])
     } catch {
       setNodes([]); setEdges([])
     } finally {
@@ -115,18 +115,14 @@ export default function BrainMapPage() {
     const d3 = await import('d3')
     const svg = d3.select(svgRef.current!)
     svg.selectAll('*').remove()
-
     const w = svgRef.current!.clientWidth || 800
     const h = svgRef.current!.clientHeight || 600
 
     const filteredNodes: BrainNode[] = activeFilter === 'all'
-      ? nodes
-      : nodes.filter(n => n.node_type === activeFilter)
-
+      ? nodes : nodes.filter(n => n.node_type === activeFilter)
     const filteredNodeIds = new Set(filteredNodes.map(n => n.id))
     const filteredEdges = edges.filter(e =>
-      filteredNodeIds.has(e.from_node) && filteredNodeIds.has(e.to_node)
-    )
+      filteredNodeIds.has(e.from_node) && filteredNodeIds.has(e.to_node))
 
     const degree: Record<string, number> = {}
     filteredEdges.forEach(e => {
@@ -136,106 +132,72 @@ export default function BrainMapPage() {
 
     const simNodes: SimNode[] = filteredNodes.map(n => ({ ...n }))
     const nodeById = new Map<string, SimNode>(simNodes.map(n => [n.id, n]))
-
     const simLinks: SimLink[] = filteredEdges
       .filter(e => nodeById.has(e.from_node) && nodeById.has(e.to_node))
-      .map(e => ({
-        source: nodeById.get(e.from_node)!,
-        target: nodeById.get(e.to_node)!,
-        edge_type: e.edge_type,
-      }))
+      .map(e => ({ source: nodeById.get(e.from_node)!, target: nodeById.get(e.to_node)!, edge_type: e.edge_type }))
 
     svg.attr('width', w).attr('height', h)
     const g = svg.append('g')
-
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.1, 6])
-      .on('zoom', (e) => g.attr('transform', e.transform))
+      .on('zoom', e => g.attr('transform', e.transform))
     svg.call(zoom)
 
     const sim = d3.forceSimulation<SimNode>(simNodes)
-      .force('link', d3.forceLink<SimNode, SimLink>(simLinks)
-        .id(d => d.id).distance(90).strength(0.35))
+      .force('link', d3.forceLink<SimNode, SimLink>(simLinks).id(d => d.id).distance(90).strength(0.35))
       .force('charge', d3.forceManyBody().strength(-250))
       .force('center', d3.forceCenter(w / 2, h / 2))
       .force('collide', d3.forceCollide<SimNode>(22))
-
     simulationRef.current = sim
 
     const link = g.append('g')
-      .selectAll<SVGLineElement, SimLink>('line')
-      .data(simLinks)
-      .join('line')
+      .selectAll<SVGLineElement, SimLink>('line').data(simLinks).join('line')
       .attr('stroke', d => COLORS[d.source.node_type] || '#888')
-      .attr('stroke-opacity', 0.2)
-      .attr('stroke-width', 1)
+      .attr('stroke-opacity', 0.2).attr('stroke-width', 1)
 
     const drag = d3.drag<SVGGElement, SimNode>()
-      .on('start', (e, d) => {
-        if (!e.active) sim.alphaTarget(0.3).restart()
-        d.fx = d.x; d.fy = d.y
-      })
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y })
       .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y })
-      .on('end', (e, d) => {
-        if (!e.active) sim.alphaTarget(0)
-        d.fx = null; d.fy = null
-      })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null })
 
     const node = g.append('g')
-      .selectAll<SVGGElement, SimNode>('g')
-      .data(simNodes)
-      .join('g')
-      .style('cursor', 'pointer')
-      .call(drag)
-      .on('click', (_e, d) => {
-        setSelectedNode({ ...d, connections: degree[d.id] || 0 })
-      })
+      .selectAll<SVGGElement, SimNode>('g').data(simNodes).join('g')
+      .style('cursor', 'pointer').call(drag)
+      .on('click', (_e, d) => setSelectedNode({ ...d, connections: degree[d.id] || 0 }))
       .on('mouseover', (_e, d) => {
         link.attr('stroke-opacity', (l: SimLink) =>
           l.source.id === d.id || l.target.id === d.id ? 0.85 : 0.04)
-        node.selectAll<SVGCircleElement, SimNode>('circle')
-          .attr('opacity', (n: SimNode) => {
-            if (n.id === d.id) return 1
-            const connected = filteredEdges.some(e =>
-              (e.from_node === d.id && e.to_node === n.id) ||
-              (e.to_node === d.id && e.from_node === n.id))
-            return connected ? 1 : 0.15
-          })
+        node.selectAll<SVGCircleElement, SimNode>('circle').attr('opacity', (n: SimNode) => {
+          if (n.id === d.id) return 1
+          const connected = filteredEdges.some(e =>
+            (e.from_node === d.id && e.to_node === n.id) || (e.to_node === d.id && e.from_node === n.id))
+          return connected ? 1 : 0.15
+        })
       })
-      .on('mouseout', () => {
-        link.attr('stroke-opacity', 0.2)
-        node.selectAll('circle').attr('opacity', 1)
-      })
+      .on('mouseout', () => { link.attr('stroke-opacity', 0.2); node.selectAll('circle').attr('opacity', 1) })
 
     node.append('circle')
       .attr('r', d => Math.max(5, 5 + (degree[d.id] || 0) * 0.8))
       .attr('fill', d => COLORS[d.node_type] || '#888')
       .attr('fill-opacity', 0.8)
       .attr('stroke', d => COLORS[d.node_type] || '#888')
-      .attr('stroke-width', 1.5)
-      .attr('stroke-opacity', 0.35)
+      .attr('stroke-width', 1.5).attr('stroke-opacity', 0.35)
 
     node.append('text')
       .text(d => d.label.length > 16 ? d.label.slice(0, 15) + '…' : d.label)
       .attr('dy', d => -(Math.max(5, 5 + (degree[d.id] || 0) * 0.8)) - 5)
-      .attr('text-anchor', 'middle')
-      .attr('font-size', '10px')
-      .attr('fill', '#9a9890')
-      .attr('pointer-events', 'none')
+      .attr('text-anchor', 'middle').attr('font-size', '10px')
+      .attr('fill', '#9a9890').attr('pointer-events', 'none')
 
     sim.on('tick', () => {
-      link
-        .attr('x1', d => d.source.x ?? 0).attr('y1', d => d.source.y ?? 0)
+      link.attr('x1', d => d.source.x ?? 0).attr('y1', d => d.source.y ?? 0)
         .attr('x2', d => d.target.x ?? 0).attr('y2', d => d.target.y ?? 0)
       node.attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`)
     })
   }
 
   const nodeTypes = ['all', ...Array.from(new Set(nodes.map(n => n.node_type)))]
-  const typeCounts = nodes.reduce((acc, n) => {
-    acc[n.node_type] = (acc[n.node_type] || 0) + 1
-    return acc
-  }, {} as Record<string, number>)
+  const typeCounts = nodes.reduce((acc, n) => ({ ...acc, [n.node_type]: (acc[n.node_type] || 0) + 1 }), {} as Record<string, number>)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0f0f13' }}>
@@ -243,16 +205,11 @@ export default function BrainMapPage() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <GitGraph style={{ width: 14, height: 14, color: '#7F77DD' }} />
           <span style={{ fontSize: 12, fontWeight: 500, color: '#e8e6df' }}>Brain Map</span>
-          {nodes.length > 0 && (
-            <span style={{ fontSize: 11, color: '#888780' }}>{nodes.length} nodes · {edges.length} edges</span>
-          )}
+          {nodes.length > 0 && <span style={{ fontSize: 11, color: '#888780' }}>{nodes.length} nodes · {edges.length} edges</span>}
         </div>
         {projects.length > 1 && (
-          <select
-            value={selectedProject}
-            onChange={e => setSelectedProject(e.target.value)}
-            style={{ fontSize: 12, padding: '4px 8px', background: '#1e1e2a', border: '0.5px solid #2e2e3a', borderRadius: 6, color: '#e8e6df' }}
-          >
+          <select value={selectedProject} onChange={e => setSelectedProject(e.target.value)}
+            style={{ fontSize: 12, padding: '4px 8px', background: '#1e1e2a', border: '0.5px solid #2e2e3a', borderRadius: 6, color: '#e8e6df' }}>
             {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
         )}
@@ -261,15 +218,13 @@ export default function BrainMapPage() {
       {nodes.length > 0 && (
         <div style={{ display: 'flex', gap: 6, padding: '8px 16px', background: '#17171e', borderBottom: '0.5px solid #2e2e3a', flexShrink: 0, flexWrap: 'wrap' }}>
           {nodeTypes.map(type => (
-            <button key={type} onClick={() => setActiveFilter(type)}
-              style={{
-                padding: '3px 10px', borderRadius: 999, fontSize: 11, cursor: 'pointer',
-                background: activeFilter === type ? '#1e1e2a' : 'transparent',
-                border: `0.5px solid ${activeFilter === type ? '#534AB7' : '#2e2e3a'}`,
-                color: activeFilter === type ? '#e8e6df' : '#888780',
-                textTransform: 'uppercase', letterSpacing: '0.06em',
-              }}
-            >
+            <button key={type} onClick={() => setActiveFilter(type)} style={{
+              padding: '3px 10px', borderRadius: 999, fontSize: 11, cursor: 'pointer',
+              background: activeFilter === type ? '#1e1e2a' : 'transparent',
+              border: `0.5px solid ${activeFilter === type ? '#534AB7' : '#2e2e3a'}`,
+              color: activeFilter === type ? '#e8e6df' : '#888780',
+              textTransform: 'uppercase', letterSpacing: '0.06em',
+            }}>
               {type === 'all' ? `All (${nodes.length})` : `${type} (${typeCounts[type] || 0})`}
             </button>
           ))}
