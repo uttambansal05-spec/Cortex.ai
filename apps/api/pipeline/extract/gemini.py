@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import anthropic
 from core.config import settings
 from pipeline.extract.chunker import Chunk
@@ -11,26 +12,64 @@ _client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 EXTRACT_PROMPT = """Analyse this code chunk and extract structured knowledge.
 
 File: {file_path} ({language})
-```{language}
-{content}
-```
 
-Return ONLY valid JSON:
-{{
-  "entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "dependencies": []}}],
-  "decisions": [{{"label": "Decision", "rationale": "Why"}}],
-  "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}],
-  "gaps": [{{"label": "Gap", "detail": "What is missing"}}],
-  "module_summary": "1-2 sentence summary"
-}}
-Extract all meaningful entities, risks, gaps and decisions present."""
+CODE:
+{content}
+
+Return ONLY valid JSON with no markdown, no backticks, no explanation:
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary"}}
+
+Extract all meaningful entities, risks, gaps and decisions. Return valid JSON only."""
+
+
+def _repair_json(text: str) -> dict:
+    """Try multiple strategies to extract valid JSON."""
+    text = text.strip()
+    
+    # Strip markdown fences
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    
+    # Find JSON object
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1:
+        try:
+            return json.loads(text[start:end+1])
+        except Exception:
+            pass
+    
+    # Try to extract just the arrays we need
+    result = {}
+    for key in ["entities", "decisions", "risks", "gaps"]:
+        pattern = rf'"{key}"\s*:\s*(\[.*?\])'
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            try:
+                result[key] = json.loads(match.group(1))
+            except Exception:
+                result[key] = []
+        else:
+            result[key] = []
+    
+    # Extract module_summary
+    summary_match = re.search(r'"module_summary"\s*:\s*"([^"]*)"', text)
+    result["module_summary"] = summary_match.group(1) if summary_match else ""
+    
+    return result if any(result.get(k) for k in ["entities", "decisions", "risks", "gaps"]) else {}
 
 
 async def extract_chunk(chunk: Chunk) -> dict:
     prompt = EXTRACT_PROMPT.format(
         file_path=chunk.file_path,
         language=chunk.language,
-        content=chunk.content[:3000],
+        content=chunk.content[:4000],
     )
     try:
         message = await asyncio.to_thread(
@@ -40,11 +79,17 @@ async def extract_chunk(chunk: Chunk) -> dict:
             messages=[{"role": "user", "content": prompt}]
         )
         text = message.content[0].text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        result = json.loads(text)
-        result["_source"] = {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}
-        return result
+        result = _repair_json(text)
+        
+        if result:
+            result["_source"] = {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}
+            log.debug("extract.success", chunk_id=chunk.chunk_id,
+                     entities=len(result.get("entities", [])))
+            return result
+        else:
+            log.warning("extract.empty_result", chunk_id=chunk.chunk_id, response=text[:100])
+            return {"_source": {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}}
+
     except Exception as e:
         log.warning("extract.error", chunk_id=chunk.chunk_id, error=str(e)[:100])
         return {"_source": {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}}
