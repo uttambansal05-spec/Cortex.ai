@@ -12,7 +12,9 @@ Here are the extracted entities, decisions, risks and gaps from {file_count} fil
 
 {extractions_json}
 
-Synthesise these into a unified knowledge graph. Merge duplicates. Return ONLY valid JSON:
+Synthesise these into a unified knowledge graph. Merge duplicates. You MUST create dependencies between entities. Every entity should link to at least one other entity, risk, or decision it is related to.
+
+Return ONLY valid JSON:
 {{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": [], "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}], "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}], "product_summary": {{"what_it_does": "2-3 sentences", "core_modules": [], "tech_stack": [], "architecture_pattern": "monolith|microservices|serverless|hybrid"}}}}
 
 Return every entity, risk, gap and decision. Do not skip anything."""
