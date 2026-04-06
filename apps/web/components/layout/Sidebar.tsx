@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Brain, LayoutDashboard, FileText, Inbox, Search, Settings, LogOut, Key } from 'lucide-react'
+import { Brain, LayoutDashboard, FileText, Inbox, Search, Settings, LogOut, Key, GitGraph } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { cn } from '@/lib/utils'
@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils'
 const NAV = [
   { href: '/dashboard', label: 'Projects', icon: LayoutDashboard, exact: true },
   { href: '/dashboard/query', label: 'Query Brain', icon: Search },
+  { href: '/dashboard/brain', label: 'Brain Map', icon: GitGraph },
   { href: '/dashboard/prd', label: 'Generate PRD', icon: FileText },
   { href: '/dashboard/intake', label: 'Intake', icon: Inbox },
 ]
