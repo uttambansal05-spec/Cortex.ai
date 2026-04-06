@@ -167,3 +167,35 @@ async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
     log.info("brain_writer.complete",
              nodes=len(nodes), edges=len(edges), communities=len(communities))
     return metadata
+
+
+async def write_community_edges(communities: list[dict], snapshot_id: str, project_id: str, db):
+    """Create weak edges between nodes in the same community."""
+    import uuid
+    rows = []
+    seen = set()
+    for community in communities:
+        node_ids = community.get("node_ids", [])
+        for i in range(len(node_ids)):
+            for j in range(i + 1, min(i + 4, len(node_ids))):
+                key = f"{node_ids[i]}:{node_ids[j]}"
+                if key not in seen:
+                    seen.add(key)
+                    rows.append({
+                        "id": str(uuid.uuid4()),
+                        "snapshot_id": snapshot_id,
+                        "project_id": project_id,
+                        "from_node": node_ids[i],
+                        "to_node": node_ids[j],
+                        "edge_type": "co_community",
+                        "weight": 0.3,
+                        "metadata": {"community": community.get("label", "")},
+                    })
+    if rows:
+        batch_size = 50
+        for i in range(0, len(rows), batch_size):
+            try:
+                db.table("brain_edges").insert(rows[i:i+batch_size]).execute()
+            except Exception:
+                pass
+    return len(rows)
