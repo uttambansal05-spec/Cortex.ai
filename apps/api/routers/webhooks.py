@@ -107,6 +107,12 @@ async def github_webhook(
         changed_files=changed_files,
     )
 
+    # Update staleness on existing brain
+    try:
+        db.rpc("update_staleness", {"p_project_id": project_id, "pr_count": 1}).execute()
+    except Exception:
+        pass  # non-critical
+
     log.info("webhook.build_triggered", project_id=project_id, pr=pr_number)
     return {"status": "triggered", "snapshot_id": snapshot_id}
 

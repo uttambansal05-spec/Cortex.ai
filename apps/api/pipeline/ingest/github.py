@@ -27,7 +27,7 @@ DEFAULT_IGNORE = [
 ]
 
 MAX_FILE_SIZE_BYTES = 100 * 1024  # 100KB hard cap
-MAX_FILES = 150
+MAX_FILES = 300
 
 
 @dataclass
@@ -54,6 +54,11 @@ def get_language(path: str) -> str:
 
 
 def should_ignore(path: str, ignore_patterns: list[str]) -> bool:
+    # Fast check: reject if any path segment is a known junk directory
+    IGNORE_DIRS = {"node_modules", "__pycache__", ".next", "dist", "build", ".git", "venv", ".venv", "coverage", ".nyc_output"}
+    for segment in path.split("/"):
+        if segment in IGNORE_DIRS:
+            return True
     for pattern in ignore_patterns:
         if fnmatch.fnmatch(path, pattern):
             return True

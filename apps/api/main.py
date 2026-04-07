@@ -45,3 +45,9 @@ app.include_router(connector.router, prefix="/api/v1/connector", tags=["connecto
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "0.1.0"}
+
+
+@app.head("/health")
+async def health_head():
+    """HEAD endpoint for uptime pingers (UptimeRobot, cron-job.org)."""
+    return {"status": "ok"}
