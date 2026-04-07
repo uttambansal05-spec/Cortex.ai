@@ -4,6 +4,7 @@ from pipeline.ingest.github import IngestedFile
 
 MAX_CHUNK_TOKENS = 6000   # safe for Gemini Flash context
 CHARS_PER_TOKEN  = 4      # rough estimate
+OVERLAP_CHARS    = 500    # overlap between chunks to prevent false truncation
 
 
 @dataclass
@@ -82,8 +83,12 @@ def chunk_file(file: IngestedFile) -> list[Chunk]:
                 end_line=current_line,
                 tokens_estimate=_estimate_tokens(current_chunk),
             ))
+            # Carry overlap from end of previous chunk to prevent
+            # functions split at boundaries appearing "truncated"
+            overlap = current_chunk[-OVERLAP_CHARS:] if len(current_chunk) > OVERLAP_CHARS else ""
             chunk_start_line = current_line
-            current_chunk = part
+            current_chunk = (overlap + "
+" + part) if overlap else part
         else:
             current_chunk += ("\n" if current_chunk else "") + part
 

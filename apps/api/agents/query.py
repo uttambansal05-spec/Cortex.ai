@@ -98,16 +98,31 @@ class QueryAgent:
         project_id: str,
         snapshot_id: str,
         question: str,
-        limit: int = 20,
+        limit: int = 25,
     ) -> list[dict]:
         """
-        Get relevant nodes. Uses keyword search on label + summary.
-        TODO: Replace with pgvector cosine similarity once embeddings are enabled.
+        Get relevant nodes using three-tier search:
+        1. Postgres GIN full-text search (fast, ranked, uses existing index)
+        2. Keyword fallback if FTS returns too few results
+        3. Risk/gap nodes always included via the SQL function
         """
-        # Extract key terms from question
+        # Tier 1: GIN full-text search via RPC
+        try:
+            fts_result = self.db.rpc("search_brain_nodes", {
+                "p_snapshot_id": snapshot_id,
+                "p_query": question,
+                "p_limit": limit,
+            }).execute()
+            if fts_result.data and len(fts_result.data) >= 5:
+                log.info("query.retrieval", method="fts", count=len(fts_result.data))
+                return fts_result.data[:limit]
+        except Exception as e:
+            log.warning("query.fts_failed", error=str(e)[:100])
+
+        # Tier 2: Keyword fallback (pulls all nodes, scores in Python)
+        log.info("query.retrieval", method="keyword_fallback")
         keywords = [w.lower() for w in question.split() if len(w) > 3]
 
-        # Pull all nodes and score by keyword overlap (simple but effective for MVP)
         result = (
             self.db.table("brain_nodes")
             .select("id, node_type, label, summary, source_file, metadata")
