@@ -1,0 +1,4495 @@
+=== apps/api/agents/intake.py ===
+import json
+import uuid
+import anthropic
+from core.config import settings
+from core.database import get_supabase
+from models.schemas import IntakeResponse, IntakeStatus
+import structlog
+from datetime import datetime, timezone
+
+log = structlog.get_logger()
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+INTAKE_PROMPT = """You are the Cortex Brain intake analyser. Analyse this feature request against the codebase.
+
+Feature request:
+Title: {title}
+Description: {description}
+
+Brain nodes (codebase knowledge):
+{nodes_context}
+
+Return ONLY valid JSON:
+{{
+  "status": "new|partial_exists|duplicate|unfeasible",
+  "known_from_brain": {{
+    "existing_relevant_code": "What already exists in the codebase related to this",
+    "affected_modules": ["module1"],
+    "relevant_apis": ["endpoint1"],
+    "effort_estimate": "Low (<1 day)|Medium (2-5 days)|High (1-2 weeks)|Unknown"
+  }},
+  "gaps": [
+    {{
+      "question": "What's missing or unclear from this request",
+      "category": "user_goal|business_rule|edge_case|success_metric|scope"
+    }}
+  ],
+  "duplicates": [
+    {{
+      "label": "Existing feature or entity that overlaps",
+      "overlap": "How it overlaps",
+      "source_file": "file/path.ts"
+    }}
+  ],
+  "risks": [
+    {{
+      "label": "Risk",
+      "severity": "high|medium|low",
+      "detail": "Why this is risky"
+    }}
+  ],
+  "recommendation": "Short recommendation: accept|needs_info|duplicate|reject",
+  "recommendation_reason": "1-2 sentence reason"
+}}"""
+
+
+class IntakeAgent:
+    def __init__(self):
+        self.db = get_supabase()
+
+    async def run(self, project_id: str, title: str, description: str) -> IntakeResponse:
+        # Get latest snapshot
+        snapshot = (
+            self.db.table("brain_snapshots")
+            .select("id")
+            .eq("project_id", project_id)
+            .eq("status", "complete")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not snapshot.data:
+            raise ValueError("No complete Brain found.")
+
+        snapshot_id = snapshot.data[0]["id"]
+        nodes = self._get_relevant_nodes(snapshot_id, f"{title} {description}")
+        nodes_context = self._format_nodes(nodes)
+
+        message = _client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": INTAKE_PROMPT.format(
+                    title=title,
+                    description=description,
+                    nodes_context=nodes_context,
+                )
+            }]
+        )
+
+        text = message.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+        analysis = json.loads(text)
+
+        # Map status
+        status_map = {
+            "new": IntakeStatus.PENDING,
+            "partial_exists": IntakeStatus.ANALYSED,
+            "duplicate": IntakeStatus.DUPLICATE,
+            "unfeasible": IntakeStatus.REJECTED,
+        }
+        status = status_map.get(analysis.get("status", "new"), IntakeStatus.ANALYSED)
+
+        # Save to DB
+        intake_id = str(uuid.uuid4())
+        self.db.table("intake_requests").insert({
+            "id": intake_id,
+            "project_id": project_id,
+            "title": title,
+            "description": description,
+            "cortex_analysis": analysis,
+            "status": status,
+        }).execute()
+
+        return IntakeResponse(
+            id=uuid.UUID(intake_id),
+            title=title,
+            status=status,
+            analysis=analysis,
+            created_at=datetime.now(timezone.utc),
+        )
+
+    def _get_relevant_nodes(self, snapshot_id: str, text: str) -> list[dict]:
+        keywords = [w.lower() for w in text.split() if len(w) > 3][:10]
+        result = (
+            self.db.table("brain_nodes")
+            .select("node_type, label, summary, source_file")
+            .eq("snapshot_id", snapshot_id)
+            .execute()
+        )
+        nodes = result.data or []
+
+        def score(n: dict) -> int:
+            haystack = f"{n['label']} {n['summary']}".lower()
+            return sum(1 for kw in keywords if kw in haystack)
+
+        return sorted(nodes, key=score, reverse=True)[:20]
+
+    def _format_nodes(self, nodes: list[dict]) -> str:
+        return "\n".join(
+            f"[{n['node_type'].upper()}] {n['label']}: {n.get('summary', '')}"
+            for n in nodes
+        )
+
+=== apps/api/agents/prd.py ===
+import json
+import uuid
+import anthropic
+from core.config import settings
+from core.database import get_supabase
+from models.schemas import PRDStep1Response, PRDResponse
+import structlog
+
+log = structlog.get_logger()
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+# In-memory session store (use Redis in production)
+_sessions: dict[str, dict] = {}
+
+CONTEXT_PROMPT = """You are the Cortex Brain. A PM wants to write a PRD for: "{feature_name}"
+
+Here is everything I know from the codebase about this feature area:
+{nodes_context}
+
+Your job: 
+1. Extract what is ALREADY KNOWN from the codebase that would go into a PRD
+2. Identify what BUSINESS QUESTIONS the PM must answer (things the code can't tell us)
+
+Return ONLY valid JSON:
+{{
+  "what_i_know": {{
+    "existing_architecture": "What code/modules already exist relevant to this feature",
+    "affected_modules": ["module1", "module2"],
+    "technical_constraints": ["constraint1"],
+    "estimated_effort": "X days based on codebase complexity",
+    "existing_apis": ["api endpoints that would be affected"],
+    "risks": ["technical risks from the codebase"],
+    "dependencies": ["what this depends on"]
+  }},
+  "questions": [
+    {{
+      "id": "q1",
+      "question": "Business question the Brain can't answer",
+      "why_needed": "Why this is required for the PRD",
+      "type": "text|select|multiline"
+    }}
+  ]
+}}
+
+Rules:
+- Only surface questions the codebase CANNOT answer
+- Do NOT ask about tech stack, existing APIs, or module structure — you already know those
+- Keep questions to the minimum needed (ideally 3-7)
+- Focus questions on: user goals, business rules, edge cases, success metrics, rollout strategy"""
+
+PRD_GENERATE_PROMPT = """You are a senior product manager writing a PRD for: "{feature_name}"
+
+CODEBASE CONTEXT (from Brain):
+{what_i_know}
+
+ANSWERS FROM PM:
+{answers}
+
+Write a complete, production-ready PRD. Format in Markdown.
+
+# {feature_name}
+
+## Overview
+[2-3 sentence summary]
+
+## Problem Statement
+[What problem this solves and for whom]
+
+## Goals & Success Metrics
+[Measurable outcomes]
+
+## User Stories
+[Key user stories with acceptance criteria]
+
+## Functional Requirements
+[Detailed requirements, informed by codebase context]
+
+## Technical Notes
+[Architecture implications, affected modules, integration points — from Brain]
+
+## Edge Cases & Risks
+[Derived from codebase analysis + PM answers]
+
+## Out of Scope
+[Explicit exclusions]
+
+## Open Questions
+[Any unresolved items]
+
+## Timeline Estimate
+[Based on codebase complexity]
+
+Rules:
+- Be specific. Reference actual module names, API endpoints, and file paths from the Brain context.
+- Flag risks inline with ⚠
+- Use tables where comparisons are needed
+- This should be ready to paste into Notion and hand to an engineer"""
+
+
+class PRDAgent:
+    def __init__(self):
+        self.db = get_supabase()
+
+    async def start(self, project_id: str, feature_name: str) -> PRDStep1Response:
+        """Step 1: Brain surfaces what it knows, returns only business questions."""
+
+        # Get latest snapshot
+        snapshot = (
+            self.db.table("brain_snapshots")
+            .select("id, metadata")
+            .eq("project_id", project_id)
+            .eq("status", "complete")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not snapshot.data:
+            raise ValueError("No complete Brain found. Build the Brain first.")
+
+        snapshot_id = snapshot.data[0]["id"]
+
+        # Get relevant nodes
+        nodes = self._get_relevant_nodes(snapshot_id, feature_name)
+        nodes_context = self._format_nodes(nodes)
+
+        message = _client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": CONTEXT_PROMPT.format(
+                    feature_name=feature_name,
+                    nodes_context=nodes_context,
+                )
+            }]
+        )
+
+        text = message.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+        result = json.loads(text)
+        session_id = str(uuid.uuid4())
+
+        # Store session
+        _sessions[session_id] = {
+            "project_id": project_id,
+            "feature_name": feature_name,
+            "snapshot_id": snapshot_id,
+            "what_i_know": result.get("what_i_know", {}),
+            "questions": result.get("questions", []),
+        }
+
+        return PRDStep1Response(
+            session_id=session_id,
+            what_i_know=result.get("what_i_know", {}),
+            questions=result.get("questions", []),
+        )
+
+    async def complete(self, session_id: str, answers: dict[str, str]) -> PRDResponse:
+        """Step 2: Generate full PRD from Brain context + PM answers."""
+
+        session = _sessions.get(session_id)
+        if not session:
+            raise ValueError("Session expired. Start PRD generation again.")
+
+        # Format answers with question text
+        answers_formatted = {}
+        for q in session["questions"]:
+            qid = q["id"]
+            if qid in answers:
+                answers_formatted[q["question"]] = answers[qid]
+
+        message = _client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": PRD_GENERATE_PROMPT.format(
+                    feature_name=session["feature_name"],
+                    what_i_know=json.dumps(session["what_i_know"], indent=2),
+                    answers=json.dumps(answers_formatted, indent=2),
+                )
+            }]
+        )
+
+        prd_content = message.content[0].text
+
+        # Save to DB
+        prd_id = str(uuid.uuid4())
+        self.db.table("prds").insert({
+            "id": prd_id,
+            "project_id": session["project_id"],
+            "snapshot_id": session["snapshot_id"],
+            "feature_name": session["feature_name"],
+            "content": prd_content,
+            "status": "draft",
+            "metadata": {
+                "what_i_know": session["what_i_know"],
+                "answers": answers_formatted,
+                "tokens": message.usage.input_tokens + message.usage.output_tokens,
+            },
+        }).execute()
+
+        # Push to Notion if configured
+        notion_url = await self._push_to_notion(
+            project_id=session["project_id"],
+            feature_name=session["feature_name"],
+            content=prd_content,
+        )
+        if notion_url:
+            self.db.table("prds").update({"notion_url": notion_url}).eq("id", prd_id).execute()
+
+        # Clean up session
+        del _sessions[session_id]
+
+        from datetime import datetime, timezone
+        return PRDResponse(
+            id=uuid.UUID(prd_id),
+            feature_name=session["feature_name"],
+            content=prd_content,
+            notion_url=notion_url,
+            metadata={"tokens": message.usage.input_tokens + message.usage.output_tokens},
+            created_at=datetime.now(timezone.utc),
+        )
+
+    def _get_relevant_nodes(self, snapshot_id: str, feature_name: str) -> list[dict]:
+        keywords = [w.lower() for w in feature_name.split() if len(w) > 2]
+        result = (
+            self.db.table("brain_nodes")
+            .select("node_type, label, summary, source_file, metadata")
+            .eq("snapshot_id", snapshot_id)
+            .execute()
+        )
+        nodes = result.data or []
+
+        def score(n: dict) -> int:
+            text = f"{n['label']} {n['summary']}".lower()
+            return sum(1 for kw in keywords if kw in text)
+
+        return sorted(nodes, key=score, reverse=True)[:25]
+
+    def _format_nodes(self, nodes: list[dict]) -> str:
+        return "\n".join(
+            f"[{n['node_type'].upper()}] {n['label']}: {n['summary']}"
+            + (f" ({n['source_file']})" if n.get("source_file") else "")
+            for n in nodes
+        )
+
+    async def _push_to_notion(
+        self,
+        project_id: str,
+        feature_name: str,
+        content: str,
+    ) -> str | None:
+        """Push PRD to Notion if database configured."""
+        project = (
+            self.db.table("projects")
+            .select("config")
+            .eq("id", project_id)
+            .single()
+            .execute()
+        )
+        notion_db_id = project.data.get("config", {}).get("notion_database_id") if project.data else None
+        if not notion_db_id or not settings.NOTION_API_KEY:
+            return None
+
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.notion.com/v1/pages",
+                    headers={
+                        "Authorization": f"Bearer {settings.NOTION_API_KEY}",
+                        "Notion-Version": "2022-06-28",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "parent": {"database_id": notion_db_id},
+                        "properties": {
+                            "Name": {"title": [{"text": {"content": feature_name}}]},
+                            "Status": {"select": {"name": "Draft"}},
+                        },
+                        "children": [{
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [{"type": "text", "text": {"content": content[:2000]}}]
+                            }
+                        }]
+                    }
+                )
+                if response.status_code == 200:
+                    return response.json().get("url")
+        except Exception as e:
+            log.warning("notion.push_failed", error=str(e))
+
+        return None
+
+=== apps/api/agents/query.py ===
+import anthropic
+from core.config import settings
+from core.database import get_supabase
+from models.schemas import QueryResponse
+import structlog
+
+log = structlog.get_logger()
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+QUERY_PROMPT = """You are the Cortex Brain — a product intelligence assistant with deep knowledge of this specific codebase.
+
+Product context:
+{product_summary}
+
+Relevant knowledge graph nodes:
+{nodes_context}
+
+Answer this question precisely and specifically:
+{question}
+
+Rules:
+- Answer from the provided nodes only. Do not invent or hallucinate.
+- If you reference a specific file, module, or decision — name it exactly.
+- If the Brain doesn't have enough context to answer confidently, say so clearly.
+- Keep answers concise but complete. Bullet points for lists, prose for explanations.
+- If you detect a risk or gap relevant to the question, flag it."""
+
+
+class QueryAgent:
+    def __init__(self):
+        self.db = get_supabase()
+
+    async def run(self, project_id: str, question: str) -> QueryResponse:
+        # Get latest complete snapshot
+        snapshot = (
+            self.db.table("brain_snapshots")
+            .select("id, version, built_at, staleness_score, metadata")
+            .eq("project_id", project_id)
+            .eq("status", "complete")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not snapshot.data:
+            raise ValueError("No complete Brain found. Build the Brain first.")
+
+        snap = snapshot.data[0]
+        staleness = snap.get("staleness_score", 0)
+
+        # Get relevant nodes via keyword + type search
+        # (Full pgvector semantic search requires embedding; use keyword fallback for now)
+        nodes = self._get_relevant_nodes(project_id, snap["id"], question)
+
+        if not nodes:
+            return QueryResponse(
+                answer="The Brain doesn't have enough context to answer this question. "
+                       "Try rebuilding the Brain or asking about a specific module.",
+                source_nodes=[],
+                staleness_warning=self._staleness_warning(staleness),
+                tokens_used=0,
+            )
+
+        # Build context
+        nodes_context = self._format_nodes(nodes)
+        product_summary = snap.get("metadata", {}).get("product_summary", {})
+
+        message = _client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": QUERY_PROMPT.format(
+                    product_summary=str(product_summary),
+                    nodes_context=nodes_context,
+                    question=question,
+                )
+            }]
+        )
+
+        answer = message.content[0].text
+        tokens = message.usage.input_tokens + message.usage.output_tokens
+
+        return QueryResponse(
+            answer=answer,
+            source_nodes=[{
+                "id": str(n["id"]),
+                "label": n["label"],
+                "type": n["node_type"],
+                "source_file": n.get("source_file"),
+            } for n in nodes[:10]],
+            staleness_warning=self._staleness_warning(staleness),
+            tokens_used=tokens,
+        )
+
+    def _get_relevant_nodes(
+        self,
+        project_id: str,
+        snapshot_id: str,
+        question: str,
+        limit: int = 20,
+    ) -> list[dict]:
+        """
+        Get relevant nodes. Uses keyword search on label + summary.
+        TODO: Replace with pgvector cosine similarity once embeddings are enabled.
+        """
+        # Extract key terms from question
+        keywords = [w.lower() for w in question.split() if len(w) > 3]
+
+        # Pull all nodes and score by keyword overlap (simple but effective for MVP)
+        result = (
+            self.db.table("brain_nodes")
+            .select("id, node_type, label, summary, source_file, metadata")
+            .eq("snapshot_id", snapshot_id)
+            .execute()
+        )
+
+        nodes = result.data or []
+
+        def score(node: dict) -> int:
+            text = f"{node['label']} {node['summary']}".lower()
+            return sum(1 for kw in keywords if kw in text)
+
+        scored = sorted(nodes, key=score, reverse=True)
+
+        # Always include risks and gaps at the top
+        priority = [n for n in scored if n["node_type"] in ("risk", "gap")]
+        rest = [n for n in scored if n["node_type"] not in ("risk", "gap")]
+
+        return (priority + rest)[:limit]
+
+    def _format_nodes(self, nodes: list[dict]) -> str:
+        lines = []
+        for n in nodes:
+            lines.append(f"[{n['node_type'].upper()}] {n['label']}")
+            if n.get("summary"):
+                lines.append(f"  → {n['summary']}")
+            if n.get("source_file"):
+                lines.append(f"  📄 {n['source_file']}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _staleness_warning(self, score: float) -> str | None:
+        if score >= 0.5:
+            return f"⚠ Brain is {round(score * 100)}% stale. Rebuild recommended for accurate answers."
+        if score >= 0.3:
+            return f"Brain is {round(score * 100)}% stale. Some answers may be outdated."
+        return None
+
+=== apps/api/core/config.py ===
+from pydantic_settings import BaseSettings
+from typing import List
+
+
+class Settings(BaseSettings):
+    ENV: str = "development"
+
+    # Supabase
+    SUPABASE_URL: str
+    SUPABASE_SERVICE_KEY: str
+
+    # AI
+    ANTHROPIC_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+
+    # GitHub
+    GITHUB_APP_ID: str = ""
+    GITHUB_APP_PRIVATE_KEY: str = ""
+    GITHUB_WEBHOOK_SECRET: str = ""
+    GITHUB_TOKEN: str = ""
+
+    # Notion
+    NOTION_API_KEY: str = ""
+
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # CORS
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "https://cortex-ai-web-rymo.vercel.app",
+    ]
+
+    # Limits
+    MAX_REPO_SIZE_MB: int = 500
+    MAX_FILE_SIZE_KB: int = 500
+    GEMINI_REQUESTS_PER_MIN: int = 15
+    CLAUDE_REQUESTS_PER_MIN: int = 50
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+settings = Settings()
+=== apps/api/core/database.py ===
+from supabase import create_client, Client
+from core.config import settings
+import structlog
+
+log = structlog.get_logger()
+
+_supabase: Client | None = None
+
+
+def get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        _supabase = create_client(
+            settings.SUPABASE_URL,
+            settings.SUPABASE_SERVICE_KEY,
+        )
+    return _supabase
+
+
+async def init_db():
+    """Verify DB connection on startup."""
+    try:
+        db = get_supabase()
+        db.table("projects").select("id").limit(1).execute()
+        log.info("database.connected")
+    except Exception as e:
+        log.error("database.connection_failed", error=str(e))
+        raise
+
+=== apps/api/main.py ===
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import structlog
+
+from core.config import settings
+from core.database import init_db
+from routers import projects, brain, agents, webhooks, api_keys, connector
+
+log = structlog.get_logger()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("cortex_api.startup", env=settings.ENV)
+    await init_db()
+    yield
+    log.info("cortex_api.shutdown")
+
+
+app = FastAPI(
+    title="Cortex API",
+    version="0.1.0",
+    docs_url="/api/docs" if settings.ENV != "production" else None,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Routers
+app.include_router(projects.router, prefix="/api/v1/projects", tags=["projects"])
+app.include_router(brain.router, prefix="/api/v1/brain", tags=["brain"])
+app.include_router(agents.router, prefix="/api/v1/agents", tags=["agents"])
+app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["webhooks"])
+app.include_router(api_keys.router, prefix="/api/v1/keys", tags=["api-keys"])
+app.include_router(connector.router, prefix="/api/v1/connector", tags=["connector"])
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "0.1.0"}
+
+=== apps/api/models/schemas.py ===
+from pydantic import BaseModel, Field
+from typing import Optional, Any
+from datetime import datetime
+from enum import Enum
+import uuid
+
+
+# ─── Enums ────────────────────────────────────────────────────────────────────
+
+class BrainStatus(str, Enum):
+    PENDING  = "pending"
+    BUILDING = "building"
+    COMPLETE = "complete"
+    FAILED   = "failed"
+
+class BuildTrigger(str, Enum):
+    MANUAL   = "manual"
+    PR_MERGE = "pr_merge"
+    SCHEDULED = "scheduled"
+
+class NodeType(str, Enum):
+    ENTITY     = "entity"
+    DECISION   = "decision"
+    RISK       = "risk"
+    GAP        = "gap"
+    DEPENDENCY = "dependency"
+    FLOW       = "flow"
+    API        = "api"
+    MODEL      = "model"
+
+class IntakeStatus(str, Enum):
+    PENDING   = "pending"
+    ANALYSED  = "analysed"
+    ACCEPTED  = "accepted"
+    REJECTED  = "rejected"
+    DUPLICATE = "duplicate"
+
+
+# ─── Project ──────────────────────────────────────────────────────────────────
+
+class ProjectConfig(BaseModel):
+    ingest_scope: list[str] = ["code", "prs"]
+    ignore_patterns: list[str] = []
+    default_branch: str = "main"
+    notion_database_id: Optional[str] = None
+
+class ProjectCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    github_repo_url: str
+    config: ProjectConfig = Field(default_factory=ProjectConfig)
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    github_repo_url: Optional[str] = None
+    config: Optional[ProjectConfig] = None
+
+class Project(BaseModel):
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    name: str
+    github_repo_url: Optional[str]
+    github_repo_id: Optional[int]
+    config: ProjectConfig
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Brain ────────────────────────────────────────────────────────────────────
+
+class BrainBuildRequest(BaseModel):
+    trigger: BuildTrigger = BuildTrigger.MANUAL
+    trigger_ref: Optional[str] = None   # PR number or commit SHA
+    incremental: bool = False
+    changed_files: list[str] = []       # for incremental builds
+
+class BrainSnapshot(BaseModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    version: int
+    status: BrainStatus
+    trigger: BuildTrigger
+    trigger_ref: Optional[str]
+    staleness_score: float
+    built_at: Optional[datetime]
+    metadata: dict[str, Any] = {}
+    created_at: datetime
+
+class BrainNode(BaseModel):
+    id: uuid.UUID
+    snapshot_id: uuid.UUID
+    project_id: uuid.UUID
+    node_type: NodeType
+    label: str
+    summary: str
+    metadata: dict[str, Any] = {}
+    source_file: Optional[str]
+    source_pr: Optional[str]
+    source_prd_id: Optional[uuid.UUID]
+    fingerprint: str
+    created_at: datetime
+
+class BrainStats(BaseModel):
+    total_nodes: int
+    by_type: dict[str, int]
+    staleness_score: float
+    last_built_at: Optional[datetime]
+    version: int
+    files_ingested: int
+    prs_processed: int
+
+
+# ─── Agents ───────────────────────────────────────────────────────────────────
+
+class QueryRequest(BaseModel):
+    project_id: uuid.UUID
+    question: str = Field(..., min_length=3, max_length=2000)
+
+class QueryResponse(BaseModel):
+    answer: str
+    source_nodes: list[dict[str, Any]]
+    staleness_warning: Optional[str]
+    tokens_used: int
+
+class PRDStep1(BaseModel):
+    project_id: uuid.UUID
+    feature_name: str = Field(..., min_length=3, max_length=200)
+
+class PRDStep1Response(BaseModel):
+    session_id: str
+    what_i_know: dict[str, Any]       # from Brain
+    questions: list[dict[str, str]]   # only business questions Brain can't answer
+
+class PRDStep2(BaseModel):
+    session_id: str
+    answers: dict[str, str]           # question_id → answer
+
+class PRDResponse(BaseModel):
+    id: uuid.UUID
+    feature_name: str
+    content: str
+    notion_url: Optional[str]
+    metadata: dict[str, Any]
+    created_at: datetime
+
+class IntakeRequest(BaseModel):
+    project_id: uuid.UUID
+    title: str = Field(..., min_length=3, max_length=200)
+    description: str = Field(..., min_length=10, max_length=5000)
+
+class IntakeResponse(BaseModel):
+    id: uuid.UUID
+    title: str
+    status: IntakeStatus
+    analysis: dict[str, Any]   # known_from_brain, gaps, duplicates, feasibility
+    created_at: datetime
+
+
+# ─── Webhooks ─────────────────────────────────────────────────────────────────
+
+class GitHubWebhookPayload(BaseModel):
+    action: Optional[str] = None
+    pull_request: Optional[dict[str, Any]] = None
+    repository: Optional[dict[str, Any]] = None
+    installation: Optional[dict[str, Any]] = None
+
+=== apps/api/pipeline/community/__init__.py ===
+
+=== apps/api/pipeline/community/detector.py ===
+import json
+import anthropic
+from core.config import settings
+from core.database import get_supabase
+import structlog
+import uuid
+
+log = structlog.get_logger()
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+COMMUNITY_PROMPT = """Group these knowledge graph nodes into logical feature communities.
+
+Nodes:
+{nodes_json}
+
+Return ONLY valid JSON:
+{{
+  "communities": [
+    {{
+      "label": "Community name (e.g. Shopping Cart, Product Catalog, Authentication)",
+      "summary": "2-3 sentences describing what this community covers",
+      "node_labels": ["NodeLabel1", "NodeLabel2"],
+      "domain": "code"
+    }}
+  ]
+}}
+
+Rules:
+- Create 5-12 communities based on feature areas
+- Every node should belong to one community
+- Name communities by product feature, not technical layer"""
+
+
+async def detect_communities(project_id: str, snapshot_id: str, nodes: list[dict]) -> list[dict]:
+    if not nodes:
+        return []
+    node_summary = [
+        {"label": n["label"], "type": n["node_type"], "summary": (n.get("summary") or "")[:80]}
+        for n in nodes
+    ]
+    log.info("community.detect_start", node_count=len(nodes))
+    try:
+        message = _client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": COMMUNITY_PROMPT.format(nodes_json=json.dumps(node_summary, indent=1))}]
+        )
+        text = message.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        result = json.loads(text)
+        communities = result.get("communities", [])
+        label_to_id = {n["label"].lower().strip(): n["id"] for n in nodes}
+        db = get_supabase()
+        rows = []
+        for community in communities:
+            node_ids = [
+                label_to_id[l.lower().strip()]
+                for l in community.get("node_labels", [])
+                if l.lower().strip() in label_to_id
+            ]
+            if not node_ids:
+                continue
+            rows.append({
+                "id": str(uuid.uuid4()),
+                "snapshot_id": snapshot_id,
+                "project_id": project_id,
+                "label": community["label"],
+                "summary": community.get("summary", ""),
+                "node_ids": node_ids,
+                "domain": community.get("domain", "code"),
+                "metadata": {"node_count": len(node_ids)},
+            })
+        if rows:
+            db.table("brain_communities").insert(rows).execute()
+            log.info("community.detect_complete", communities=len(rows))
+        return rows
+    except Exception as e:
+        log.error("community.detect_failed", error=str(e)[:200])
+        return []
+
+=== apps/api/pipeline/extract/chunker.py ===
+import re
+from dataclasses import dataclass
+from pipeline.ingest.github import IngestedFile
+
+MAX_CHUNK_TOKENS = 6000   # safe for Gemini Flash context
+CHARS_PER_TOKEN  = 4      # rough estimate
+
+
+@dataclass
+class Chunk:
+    chunk_id: str
+    file_path: str
+    language: str
+    content: str
+    chunk_index: int
+    total_chunks: int
+    start_line: int
+    end_line: int
+    tokens_estimate: int
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(text) // CHARS_PER_TOKEN
+
+
+def _split_by_semantic_boundary(content: str, language: str) -> list[str]:
+    """Split code at function/class boundaries where possible."""
+    if language in ("python",):
+        # Split on top-level def/class
+        pattern = r'\n(?=(?:def |class |async def ))'
+    elif language in ("javascript", "typescript"):
+        # Split on function declarations and class definitions
+        pattern = r'\n(?=(?:function |class |const \w+ = |export ))'
+    elif language in ("java", "kotlin", "csharp"):
+        pattern = r'\n(?=(?:public |private |protected |class |interface ))'
+    else:
+        pattern = r'\n\n+'  # Split on blank lines for others
+
+    parts = re.split(pattern, content)
+    return [p for p in parts if p.strip()]
+
+
+def chunk_file(file: IngestedFile) -> list[Chunk]:
+    """Split a file into context-window-safe chunks."""
+    content = file.content
+    total_tokens = _estimate_tokens(content)
+
+    # If small enough, return as single chunk
+    if total_tokens <= MAX_CHUNK_TOKENS:
+        return [Chunk(
+            chunk_id=f"{file.path}::0",
+            file_path=file.path,
+            language=file.language,
+            content=content,
+            chunk_index=0,
+            total_chunks=1,
+            start_line=1,
+            end_line=content.count('\n') + 1,
+            tokens_estimate=total_tokens,
+        )]
+
+    # Split semantically first, then by size
+    semantic_parts = _split_by_semantic_boundary(content, file.language)
+    chunks: list[Chunk] = []
+    current_chunk = ""
+    current_line = 1
+    chunk_start_line = 1
+
+    for part in semantic_parts:
+        part_tokens = _estimate_tokens(part)
+
+        if _estimate_tokens(current_chunk + part) > MAX_CHUNK_TOKENS and current_chunk:
+            # Flush current chunk
+            chunks.append(Chunk(
+                chunk_id=f"{file.path}::{len(chunks)}",
+                file_path=file.path,
+                language=file.language,
+                content=current_chunk,
+                chunk_index=len(chunks),
+                total_chunks=0,  # filled after
+                start_line=chunk_start_line,
+                end_line=current_line,
+                tokens_estimate=_estimate_tokens(current_chunk),
+            ))
+            chunk_start_line = current_line
+            current_chunk = part
+        else:
+            current_chunk += ("\n" if current_chunk else "") + part
+
+        current_line += part.count('\n') + 1
+
+    # Flush remaining
+    if current_chunk:
+        chunks.append(Chunk(
+            chunk_id=f"{file.path}::{len(chunks)}",
+            file_path=file.path,
+            language=file.language,
+            content=current_chunk,
+            chunk_index=len(chunks),
+            total_chunks=0,
+            start_line=chunk_start_line,
+            end_line=current_line,
+            tokens_estimate=_estimate_tokens(current_chunk),
+        ))
+
+    # Fill total_chunks
+    total = len(chunks)
+    for chunk in chunks:
+        chunk.total_chunks = total
+
+    return chunks
+
+=== apps/api/pipeline/extract/gemini.py ===
+import asyncio
+import json
+import re
+import anthropic
+from core.config import settings
+from pipeline.extract.chunker import Chunk
+import structlog
+
+log = structlog.get_logger()
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+EXTRACT_PROMPT = """Analyse this code chunk and extract structured knowledge.
+
+File: {file_path} ({language})
+
+CODE:
+{content}
+
+Return ONLY valid JSON with no markdown, no backticks, no explanation:
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary"}}
+
+Extract all meaningful entities, risks, gaps and decisions. Return valid JSON only."""
+
+
+def _repair_json(text: str) -> dict:
+    """Try multiple strategies to extract valid JSON."""
+    text = text.strip()
+    
+    # Strip markdown fences
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    
+    # Find JSON object
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1:
+        try:
+            return json.loads(text[start:end+1])
+        except Exception:
+            pass
+    
+    # Try to extract just the arrays we need
+    result = {}
+    for key in ["entities", "decisions", "risks", "gaps"]:
+        pattern = rf'"{key}"\s*:\s*(\[.*?\])'
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            try:
+                result[key] = json.loads(match.group(1))
+            except Exception:
+                result[key] = []
+        else:
+            result[key] = []
+    
+    # Extract module_summary
+    summary_match = re.search(r'"module_summary"\s*:\s*"([^"]*)"', text)
+    result["module_summary"] = summary_match.group(1) if summary_match else ""
+    
+    return result if any(result.get(k) for k in ["entities", "decisions", "risks", "gaps"]) else {}
+
+
+async def extract_chunk(chunk: Chunk) -> dict:
+    prompt = EXTRACT_PROMPT.format(
+        file_path=chunk.file_path,
+        language=chunk.language,
+        content=chunk.content[:4000],
+    )
+    try:
+        message = await asyncio.to_thread(
+            _client.messages.create,
+            model="claude-haiku-4-5",
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = message.content[0].text.strip()
+        result = _repair_json(text)
+        
+        if result:
+            result["_source"] = {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}
+            log.debug("extract.success", chunk_id=chunk.chunk_id,
+                     entities=len(result.get("entities", [])))
+            return result
+        else:
+            log.warning("extract.empty_result", chunk_id=chunk.chunk_id, response=text[:100])
+            return {"_source": {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}}
+
+    except Exception as e:
+        log.warning("extract.error", chunk_id=chunk.chunk_id, error=str(e)[:100])
+        return {"_source": {"file_path": chunk.file_path, "chunk_id": chunk.chunk_id}}
+
+
+async def extract_chunks_parallel(chunks: list[Chunk], max_concurrent: int = 1) -> list[dict]:
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def extract_with_semaphore(chunk: Chunk) -> dict:
+        async with semaphore:
+            result = await extract_chunk(chunk)
+            await asyncio.sleep(3.0)
+            return result
+
+    log.info("extract.batch_start", total_chunks=len(chunks))
+    results = await asyncio.gather(*[extract_with_semaphore(c) for c in chunks], return_exceptions=True)
+    clean = [r for r in results if not isinstance(r, Exception)]
+    log.info("extract.batch_complete", success=len(clean), failed=len(results)-len(clean))
+    return clean
+
+=== apps/api/pipeline/ingest/github.py ===
+import os
+import base64
+import fnmatch
+from dataclasses import dataclass
+from typing import Iterator
+from github import Github, GithubException
+from core.config import settings
+import structlog
+
+log = structlog.get_logger()
+
+INGEST_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".kt", ".swift",
+    ".go", ".rs", ".rb", ".php", ".cs", ".cpp", ".c", ".h",
+    ".json", ".yaml", ".yml", ".toml",
+    ".md", ".mdx", ".txt",
+    ".html", ".css", ".scss", ".vue", ".svelte",
+}
+
+DEFAULT_IGNORE = [
+    "node_modules/**", ".git/**", "dist/**", "build/**", ".next/**",
+    "*.min.js", "*.min.css", "*.map", "*.lock", "*.log",
+    "__pycache__/**", "*.pyc", ".venv/**", "venv/**",
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico",
+    "*.pdf", "*.zip", "*.tar", "*.gz",
+    "coverage/**", ".nyc_output/**",
+]
+
+MAX_FILE_SIZE_BYTES = 100 * 1024  # 100KB hard cap
+MAX_FILES = 150
+
+
+@dataclass
+class IngestedFile:
+    path: str
+    content: str
+    language: str
+    size_bytes: int
+    last_modified: str
+    pr_blame: str | None = None
+
+
+def get_language(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    lang_map = {
+        ".py": "python", ".js": "javascript", ".ts": "typescript",
+        ".jsx": "javascript", ".tsx": "typescript", ".java": "java",
+        ".kt": "kotlin", ".go": "go", ".rs": "rust", ".rb": "ruby",
+        ".md": "markdown", ".yaml": "yaml", ".yml": "yaml",
+        ".json": "json", ".html": "html", ".css": "css",
+        ".scss": "scss", ".vue": "vue", ".svelte": "svelte",
+    }
+    return lang_map.get(ext, "text")
+
+
+def should_ignore(path: str, ignore_patterns: list[str]) -> bool:
+    for pattern in ignore_patterns:
+        if fnmatch.fnmatch(path, pattern):
+            return True
+        if fnmatch.fnmatch(os.path.basename(path), pattern):
+            return True
+    return False
+
+
+def ingest_github_repo(
+    repo_url: str,
+    github_token: str,
+    branch: str = "main",
+    changed_files: list[str] | None = None,
+) -> Iterator[IngestedFile]:
+    g = Github(github_token, timeout=30)
+    repo_name = repo_url.rstrip("/").replace("https://github.com/", "")
+    repo = g.get_repo(repo_name)
+
+    log.info("github.ingest.start", repo=repo_name, branch=branch)
+
+    file_count = 0
+
+    try:
+        try:
+            branch_obj = repo.get_branch(branch)
+        except GithubException:
+            branch_obj = repo.get_branch("master")
+
+        sha = branch_obj.commit.commit.tree.sha
+        tree = repo.get_git_tree(sha, recursive=True)
+        
+        all_items = [i for i in tree.tree if i.type == "blob"]
+        log.info("github.ingest.tree_fetched", total_blobs=len(all_items))
+
+        for item in all_items:
+            if file_count >= MAX_FILES:
+                log.warning("github.ingest.max_files_reached", limit=MAX_FILES)
+                break
+
+            full_path = item.path
+            ext = os.path.splitext(full_path)[1].lower()
+
+            # Check extension first (fast)
+            if ext not in INGEST_EXTENSIONS:
+                continue
+
+            # Check ignore patterns
+            if should_ignore(full_path, DEFAULT_IGNORE):
+                continue
+
+            # Check file size
+            if item.size and item.size > MAX_FILE_SIZE_BYTES:
+                log.debug("github.ingest.skip_large", path=full_path, size=item.size)
+                continue
+
+            # Filter for incremental builds
+            if changed_files and full_path not in changed_files:
+                continue
+
+            # Fetch actual file content
+            try:
+                blob = repo.get_git_blob(item.sha)
+                if blob.encoding == "base64":
+                    content_bytes = base64.b64decode(blob.content)
+                else:
+                    content_bytes = blob.content.encode("utf-8")
+                
+                content = content_bytes.decode("utf-8", errors="replace")
+
+                yield IngestedFile(
+                    path=full_path,
+                    content=content,
+                    language=get_language(full_path),
+                    size_bytes=len(content_bytes),
+                    last_modified="",
+                )
+                file_count += 1
+
+                if file_count % 10 == 0:
+                    log.info("github.ingest.progress", files_done=file_count)
+
+            except Exception as e:
+                log.warning("github.ingest.file_error", path=full_path, error=str(e)[:80])
+                continue
+
+    except GithubException as e:
+        log.error("github.ingest.error", error=str(e))
+        raise
+
+    log.info("github.ingest.complete", repo=repo_name, file_count=file_count)
+
+=== apps/api/pipeline/store/brain_writer.py ===
+import json
+import hashlib
+import uuid
+from core.database import get_supabase
+import structlog
+from datetime import datetime, timezone
+
+log = structlog.get_logger()
+
+NODE_TYPE_MAP = {
+    "entities":     "entity",
+    "decisions":    "decision",
+    "risks":        "risk",
+    "gaps":         "gap",
+    "dependencies": "dependency",
+    "user_flows":   "flow",
+    "apis":         "api",
+    "data_models":  "model",
+}
+
+EDGE_TYPE_MAP = {
+    "imports": "imports", "calls": "calls", "extends": "extends",
+    "uses": "uses", "triggers": "triggers", "depends_on": "depends_on",
+}
+
+
+def _fingerprint(node_type: str, label: str, project_id: str) -> str:
+    key = f"{project_id}:{node_type}:{label.lower().strip()}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]:
+    rows = []
+    seen = set()
+    for graph_key, node_type in NODE_TYPE_MAP.items():
+        for item in graph.get(graph_key, []):
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or item.get("from_entity") or ""
+            if not label:
+                continue
+            fp = _fingerprint(node_type, str(label), project_id)
+            if fp in seen:
+                continue
+            seen.add(fp)
+            summary = (
+                item.get("summary") or item.get("detail") or item.get("rationale") or
+                f"{item.get('from_entity', '')} → {item.get('to_entity', '')}"
+            )
+            source_files = item.get("source_files") or []
+            source_file = source_files[0] if source_files else item.get("source_file")
+            rows.append({
+                "id": str(uuid.uuid4()),
+                "snapshot_id": snapshot_id,
+                "project_id": project_id,
+                "node_type": node_type,
+                "label": str(label)[:500],
+                "summary": str(summary or "")[:2000],
+                "metadata": {k: v for k, v in item.items()
+                             if k not in ("label", "summary", "detail", "rationale")},
+                "source_file": source_file,
+                "source_pr": None,
+                "fingerprint": fp,
+                "domain": "code",
+                "source_type": "github",
+            })
+    return rows
+
+
+def _extract_edges(graph: dict, label_to_id: dict, snapshot_id: str, project_id: str) -> list[dict]:
+    edges = []
+    seen = set()
+
+    def add_edge(from_label, to_label, edge_type, is_external=False):
+        from_id = label_to_id.get(from_label.lower().strip())
+        to_id = label_to_id.get(to_label.lower().strip())
+        if not from_id or not to_id:
+            return
+        key = f"{from_id}:{to_id}:{edge_type}"
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append({
+            "id": str(uuid.uuid4()),
+            "snapshot_id": snapshot_id,
+            "project_id": project_id,
+            "from_node": from_id,
+            "to_node": to_id,
+            "edge_type": edge_type,
+            "weight": 1.0,
+            "metadata": {"is_external": is_external},
+        })
+
+    for dep in graph.get("dependencies", []):
+        if not isinstance(dep, dict):
+            continue
+        from_e = dep.get("from_entity", "")
+        to_e = dep.get("to_entity", "")
+        edge_type = EDGE_TYPE_MAP.get(dep.get("type", ""), "depends_on")
+        if from_e and to_e:
+            add_edge(from_e, to_e, edge_type, dep.get("is_external", False))
+
+    for entity in graph.get("entities", []):
+        if not isinstance(entity, dict):
+            continue
+        from_label = entity.get("label", "")
+        for dep_label in entity.get("dependencies", []):
+            if dep_label and from_label:
+                add_edge(from_label, dep_label, "depends_on")
+
+    return edges
+
+
+async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
+    db = get_supabase()
+    db.table("brain_snapshots").update({"status": "building"}).eq("id", snapshot_id).execute()
+
+    nodes = _extract_nodes(graph, project_id, snapshot_id)
+    log.info("brain_writer.writing_nodes", count=len(nodes))
+
+    label_to_id = {}
+    batch_size = 50
+    for i in range(0, len(nodes), batch_size):
+        batch = nodes[i:i + batch_size]
+        db.table("brain_nodes").insert(batch).execute()
+        for n in batch:
+            label_to_id[n["label"].lower().strip()] = n["id"]
+
+    edges = _extract_edges(graph, label_to_id, snapshot_id, project_id)
+    if edges:
+        for i in range(0, len(edges), batch_size):
+            try:
+                db.table("brain_edges").insert(edges[i:i + batch_size]).execute()
+            except Exception as e:
+                log.warning("brain_writer.edge_insert_failed", error=str(e)[:100])
+
+    # Community detection
+    communities = []
+    try:
+        from pipeline.community.detector import detect_communities
+        communities = await detect_communities(project_id, snapshot_id, nodes)
+        log.info("brain_writer.communities_done", count=len(communities))
+    except Exception as e:
+        log.warning("brain_writer.community_detection_failed", error=str(e)[:200])
+
+    by_type: dict[str, int] = {}
+    for node in nodes:
+        t = node["node_type"]
+        by_type[t] = by_type.get(t, 0) + 1
+
+    product_summary = graph.get("product_summary", {})
+    metadata = {
+        "total_nodes": len(nodes),
+        "total_edges": len(edges),
+        "total_communities": len(communities),
+        "by_type": by_type,
+        "product_summary": product_summary,
+    }
+
+    db.table("brain_snapshots").update({
+        "status": "complete",
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "staleness_score": 0.0,
+        "metadata": metadata,
+    }).eq("id", snapshot_id).execute()
+
+    log.info("brain_writer.complete",
+             nodes=len(nodes), edges=len(edges), communities=len(communities))
+    return metadata
+
+
+async def write_community_edges(communities: list[dict], snapshot_id: str, project_id: str, db):
+    """Create weak edges between nodes in the same community."""
+    import uuid
+    rows = []
+    seen = set()
+    for community in communities:
+        node_ids = community.get("node_ids", [])
+        for i in range(len(node_ids)):
+            for j in range(i + 1, min(i + 4, len(node_ids))):
+                key = f"{node_ids[i]}:{node_ids[j]}"
+                if key not in seen:
+                    seen.add(key)
+                    rows.append({
+                        "id": str(uuid.uuid4()),
+                        "snapshot_id": snapshot_id,
+                        "project_id": project_id,
+                        "from_node": node_ids[i],
+                        "to_node": node_ids[j],
+                        "edge_type": "co_community",
+                        "weight": 0.3,
+                        "metadata": {"community": community.get("label", "")},
+                    })
+    if rows:
+        batch_size = 50
+        for i in range(0, len(rows), batch_size):
+            try:
+                db.table("brain_edges").insert(rows[i:i+batch_size]).execute()
+            except Exception:
+                pass
+    return len(rows)
+
+=== apps/api/pipeline/synthesise/claude.py ===
+import json
+import anthropic
+from core.config import settings
+import structlog
+
+log = structlog.get_logger()
+_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+SYNTHESISE_PROMPT = """You are building a knowledge graph from code extractions.
+
+Here are the extracted entities, decisions, risks and gaps from {file_count} files:
+
+{extractions_json}
+
+Synthesise these into a unified knowledge graph. Merge duplicates. You MUST create dependencies between entities. Every entity should link to at least one other entity, risk, or decision it is related to.
+
+Return ONLY valid JSON:
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": [], "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}], "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}], "product_summary": {{"what_it_does": "2-3 sentences", "core_modules": [], "tech_stack": [], "architecture_pattern": "monolith|microservices|serverless|hybrid"}}}}
+
+Return every entity, risk, gap and decision. Do not skip anything."""
+
+
+def _clean_json(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            try:
+                return json.loads(text[start:end+1])
+            except Exception:
+                pass
+    return {}
+
+
+def _empty_graph() -> dict:
+    return {
+        "entities": [], "decisions": [], "risks": [], "gaps": [],
+        "dependencies": [], "user_flows": [],
+        "product_summary": {"what_it_does": "", "core_modules": [], "tech_stack": [], "architecture_pattern": "unknown"}
+    }
+
+
+def _merge(partials: list[dict]) -> dict:
+    merged = {"entities": [], "decisions": [], "risks": [], "gaps": [], "dependencies": [], "user_flows": [], "product_summary": {}}
+    for p in partials:
+        for k in ["entities", "decisions", "risks", "gaps", "dependencies", "user_flows"]:
+            merged[k].extend(p.get(k, []) if isinstance(p.get(k), list) else [])
+        if p.get("product_summary"):
+            merged["product_summary"] = p["product_summary"]
+    return merged
+
+
+def _flatten_extractions(extractions: list[dict]) -> list[dict]:
+    """Convert raw extractions to flat list of items with source file."""
+    flat = []
+    for e in extractions:
+        source = e.get("_source", {})
+        file_path = source.get("file_path", "unknown")
+        for entity in e.get("entities", []):
+            entity["source_files"] = [file_path]
+            flat.append({"type": "entity", **entity})
+        for decision in e.get("decisions", []):
+            decision["source_files"] = [file_path]
+            flat.append({"type": "decision", **decision})
+        for risk in e.get("risks", []):
+            risk["source_files"] = [file_path]
+            flat.append({"type": "risk", **risk})
+        for gap in e.get("gaps", []):
+            gap["source_files"] = [file_path]
+            flat.append({"type": "gap", **gap})
+    return flat
+
+
+async def synthesise_extractions(extractions: list[dict]) -> dict:
+    flat = _flatten_extractions(extractions)
+    
+    log.info("claude.synthesise.start",
+             total_files=len(extractions),
+             total_items=len(flat))
+
+    if not flat:
+        return _empty_graph()
+
+    # Split into batches of 50 items
+    batch_size = 50
+    batches = [flat[i:i+batch_size] for i in range(0, len(flat), batch_size)]
+    partials = []
+
+    total_batches = len(batches)
+    for i, batch in enumerate(batches):
+        log.info("claude.synthesise.batch", batch=i+1, total=total_batches)
+        payload = json.dumps(batch, indent=1)
+
+        try:
+            message = _client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=8192,
+                timeout=90,
+                messages=[{"role": "user", "content": SYNTHESISE_PROMPT.format(
+                    file_count=len(set(item.get("source_files", ["?"])[0] for item in batch)),
+                    extractions_json=payload
+                )}]
+            )
+            result = _clean_json(message.content[0].text)
+            log.info("claude.synthesise.batch_result",
+                     batch=i+1,
+                     entities=len(result.get("entities", [])),
+                     risks=len(result.get("risks", [])))
+            partials.append(result if result else _empty_graph())
+        except Exception as e:
+            log.error("claude.synthesise.batch_failed", batch=i+1, error=str(e)[:200])
+            partials.append(_empty_graph())
+
+    merged = _merge(partials)
+    log.info("claude.synthesise.complete",
+             entities=len(merged.get("entities", [])),
+             risks=len(merged.get("risks", [])))
+    return merged
+
+=== apps/api/routers/agents.py ===
+from fastapi import APIRouter, HTTPException, Header
+from models.schemas import (
+    QueryRequest, QueryResponse,
+    PRDStep1, PRDStep1Response,
+    PRDStep2, PRDResponse,
+    IntakeRequest, IntakeResponse,
+)
+from agents.query import QueryAgent
+from agents.prd import PRDAgent
+from agents.intake import IntakeAgent
+import structlog
+
+router = APIRouter()
+log = structlog.get_logger()
+
+query_agent  = QueryAgent()
+prd_agent    = PRDAgent()
+intake_agent = IntakeAgent()
+
+
+@router.post("/query", response_model=QueryResponse)
+async def query_brain(
+    payload: QueryRequest,
+    authorization: str = Header(...),
+):
+    """Ask the Brain a question. Returns answer + source nodes."""
+    try:
+        result = await query_agent.run(
+            project_id=str(payload.project_id),
+            question=payload.question,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        log.error("query_agent.error", error=str(e))
+        raise HTTPException(status_code=500, detail="Query failed")
+
+
+@router.post("/prd/start", response_model=PRDStep1Response)
+async def start_prd(
+    payload: PRDStep1,
+    authorization: str = Header(...),
+):
+    """Step 1: Brain surfaces what it knows. Returns only business questions."""
+    try:
+        result = await prd_agent.start(
+            project_id=str(payload.project_id),
+            feature_name=payload.feature_name,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/prd/complete", response_model=PRDResponse)
+async def complete_prd(
+    payload: PRDStep2,
+    authorization: str = Header(...),
+):
+    """Step 2: User answers business questions. Generates + saves PRD."""
+    try:
+        result = await prd_agent.complete(
+            session_id=payload.session_id,
+            answers=payload.answers,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/prd/{project_id}")
+async def list_prds(project_id: str, authorization: str = Header(...)):
+    from core.database import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("prds")
+        .select("id, feature_name, notion_url, status, created_at")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@router.post("/intake", response_model=IntakeResponse)
+async def submit_intake(
+    payload: IntakeRequest,
+    authorization: str = Header(...),
+):
+    """Submit a feature request for Brain analysis."""
+    try:
+        result = await intake_agent.run(
+            project_id=str(payload.project_id),
+            title=payload.title,
+            description=payload.description,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/intake/{project_id}")
+async def list_intake(project_id: str, authorization: str = Header(...)):
+    from core.database import get_supabase
+    db = get_supabase()
+    result = (
+        db.table("intake_requests")
+        .select("id, title, status, cortex_analysis, created_at")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+=== apps/api/routers/api_keys.py ===
+import secrets
+import hashlib
+import uuid
+from fastapi import APIRouter, HTTPException, Header
+from core.database import get_supabase
+import structlog
+
+router = APIRouter()
+log = structlog.get_logger()
+
+
+def _get_user_id(authorization: str) -> str:
+    import jwt as pyjwt
+    try:
+        token = authorization.replace("Bearer ", "").strip()
+        decoded = pyjwt.decode(token, options={"verify_signature": False})
+        user_id = decoded.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+def _hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def verify_api_key(api_key: str) -> dict:
+    db = get_supabase()
+    key_hash = _hash_key(api_key)
+    result = (
+        db.table("api_keys")
+        .select("*, projects(id, name)")
+        .eq("key_hash", key_hash)
+        .eq("is_active", True)
+        .single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+    return result.data
+
+
+@router.post("/", status_code=201)
+async def create_api_key(name: str, project_id: str, authorization: str = Header(...)):
+    user_id = _get_user_id(authorization)
+    db = get_supabase()
+    raw_key = f"ctx_{secrets.token_urlsafe(32)}"
+    key_hash = _hash_key(raw_key)
+    key_prefix = raw_key[:12]
+    result = db.table("api_keys").insert({
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "project_id": project_id,
+        "key_hash": key_hash,
+        "key_prefix": key_prefix,
+        "created_by": user_id,
+        "is_active": True,
+    }).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create API key")
+    log.info("api_key.created", prefix=key_prefix, project_id=project_id)
+    return {**result.data[0], "key": raw_key}
+
+
+@router.get("/")
+async def list_api_keys(project_id: str, authorization: str = Header(...)):
+    _get_user_id(authorization)
+    db = get_supabase()
+    result = (
+        db.table("api_keys")
+        .select("id, name, project_id, key_prefix, is_active, created_at")
+        .eq("project_id", project_id)
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@router.delete("/{key_id}", status_code=204)
+async def revoke_api_key(key_id: str, authorization: str = Header(...)):
+    _get_user_id(authorization)
+    db = get_supabase()
+    db.table("api_keys").update({"is_active": False}).eq("id", key_id).execute()
+
+=== apps/api/routers/brain.py ===
+from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
+from models.schemas import BrainBuildRequest, BrainSnapshot, BrainStats, BrainStatus
+from core.database import get_supabase
+from workers.build_brain import build_brain_task
+import structlog
+import uuid
+
+router = APIRouter()
+log = structlog.get_logger()
+
+
+@router.post("/{project_id}/build", status_code=202)
+async def trigger_build(
+    project_id: str,
+    payload: BrainBuildRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str = Header(...),
+):
+    """Trigger a Brain build. Returns immediately — build runs in background."""
+    db = get_supabase()
+
+    # Check no active build running
+    active = (
+        db.table("brain_snapshots")
+        .select("id")
+        .eq("project_id", project_id)
+        .eq("status", BrainStatus.BUILDING)
+        .execute()
+    )
+    if active.data:
+        raise HTTPException(status_code=409, detail="Build already in progress")
+
+    # Get current version
+    latest = (
+        db.table("brain_snapshots")
+        .select("version")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    next_version = (latest.data[0]["version"] + 1) if latest.data else 1
+
+    # Create snapshot record
+    snapshot_id = str(uuid.uuid4())
+    db.table("brain_snapshots").insert({
+        "id": snapshot_id,
+        "project_id": project_id,
+        "version": next_version,
+        "status": BrainStatus.PENDING,
+        "trigger": payload.trigger,
+        "trigger_ref": payload.trigger_ref,
+        "staleness_score": 0,
+        "metadata": {
+            "incremental": payload.incremental,
+            "changed_files": payload.changed_files,
+        },
+    }).execute()
+
+    # Dispatch to Celery worker
+    build_brain_task.delay(
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        incremental=payload.incremental,
+        changed_files=payload.changed_files,
+    )
+
+    log.info("brain.build_triggered", project_id=project_id, snapshot_id=snapshot_id, version=next_version)
+    return {"snapshot_id": snapshot_id, "version": next_version, "status": "pending"}
+
+
+@router.get("/{project_id}/status")
+async def get_brain_status(project_id: str, authorization: str = Header(...)):
+    """Get latest snapshot status + stats."""
+    db = get_supabase()
+    result = (
+        db.table("brain_snapshots")
+        .select("*")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return {"status": "none", "message": "No Brain built yet"}
+
+    snapshot = result.data[0]
+
+    # Node counts by type
+    nodes = (
+        db.table("brain_nodes")
+        .select("node_type")
+        .eq("snapshot_id", snapshot["id"])
+        .execute()
+    )
+    by_type: dict[str, int] = {}
+    for node in (nodes.data or []):
+        by_type[node["node_type"]] = by_type.get(node["node_type"], 0) + 1
+
+    return {
+        **snapshot,
+        "stats": {
+            "total_nodes": len(nodes.data or []),
+            "by_type": by_type,
+        },
+    }
+
+
+@router.get("/{project_id}/nodes")
+async def get_brain_nodes(
+    project_id: str,
+    node_type: str | None = None,
+    authorization: str = Header(...),
+):
+    """Get all brain nodes for the latest snapshot."""
+    db = get_supabase()
+
+    # Get latest complete snapshot
+    snapshot = (
+        db.table("brain_snapshots")
+        .select("id")
+        .eq("project_id", project_id)
+        .eq("status", BrainStatus.COMPLETE)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not snapshot.data:
+        raise HTTPException(status_code=404, detail="No complete Brain found")
+
+    query = (
+        db.table("brain_nodes")
+        .select("id, node_type, label, summary, source_file, source_pr, metadata, created_at")
+        .eq("snapshot_id", snapshot.data[0]["id"])
+    )
+    if node_type:
+        query = query.eq("node_type", node_type)
+
+    result = query.order("node_type").execute()
+    return result.data
+
+
+@router.get("/{project_id}/history")
+async def get_build_history(project_id: str, authorization: str = Header(...)):
+    db = get_supabase()
+    result = (
+        db.table("brain_snapshots")
+        .select("id, version, status, trigger, built_at, staleness_score, metadata")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+    return result.data
+
+=== apps/api/routers/connector.py ===
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel, Field
+from agents.query import QueryAgent
+from routers.api_keys import verify_api_key
+import structlog
+
+router = APIRouter()
+log = structlog.get_logger()
+query_agent = QueryAgent()
+
+
+class ConnectorQueryRequest(BaseModel):
+    question: str = Field(..., min_length=3, max_length=2000)
+    project_id: str | None = None
+
+
+class ConnectorQueryResponse(BaseModel):
+    answer: str
+    source_nodes: list[dict]
+    staleness_warning: str | None
+    tokens_used: int
+    project: str
+
+
+@router.post("/query")
+async def connector_query(
+    payload: ConnectorQueryRequest,
+    x_cortex_key: str = Header(..., alias="x-cortex-key"),
+):
+    """
+    Public Brain query endpoint. Authenticate with your Cortex API key.
+    
+    Headers:
+      x-cortex-key: ctx_your_api_key_here
+    
+    Body:
+      { "question": "What does this product do?", "project_id": "optional-uuid" }
+    """
+    key_data = verify_api_key(x_cortex_key)
+    project_id = payload.project_id or key_data["project_id"]
+
+    try:
+        result = await query_agent.run(
+            project_id=project_id,
+            question=payload.question,
+        )
+        return ConnectorQueryResponse(
+            answer=result.answer,
+            source_nodes=result.source_nodes,
+            staleness_warning=result.staleness_warning,
+            tokens_used=result.tokens_used,
+            project=key_data.get("projects", {}).get("name", project_id),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        log.error("connector.query_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Query failed")
+
+
+@router.get("/health")
+async def connector_health(x_cortex_key: str = Header(..., alias="x-cortex-key")):
+    """Verify your API key is valid."""
+    key_data = verify_api_key(x_cortex_key)
+    return {
+        "status": "ok",
+        "project": key_data.get("projects", {}).get("name"),
+        "project_id": key_data["project_id"],
+    }
+
+=== apps/api/routers/projects.py ===
+from fastapi import APIRouter, HTTPException, Header
+from models.schemas import Project, ProjectCreate, ProjectUpdate
+from core.database import get_supabase
+import structlog
+import uuid
+
+router = APIRouter()
+log = structlog.get_logger()
+
+
+import jwt as pyjwt
+
+def _get_workspace_id(authorization: str) -> str:
+    """Extract user ID from Supabase JWT by decoding it directly."""
+    try:
+        token = authorization.replace("Bearer ", "").strip()
+        # Decode without verification first to get the user ID
+        # Supabase tokens are verified by the service itself
+        decoded = pyjwt.decode(token, options={"verify_signature": False})
+        user_id = decoded.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Auth error: {str(e)}")
+
+
+@router.get("/")
+async def list_projects(authorization: str = Header(...)):
+    workspace_id = _get_workspace_id(authorization)
+    db = get_supabase()
+    result = (
+        db.table("projects")
+        .select("*, brain_snapshots(id, version, status, built_at, staleness_score)")
+        .eq("workspace_id", workspace_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@router.post("/", status_code=201)
+async def create_project(
+    payload: ProjectCreate,
+    authorization: str = Header(...),
+):
+    user_id = _get_workspace_id(authorization)
+    db = get_supabase()
+
+    # Look up workspace by owner_id
+    workspace = (
+        db.table("workspaces")
+        .select("id")
+        .eq("owner_id", user_id)
+        .single()
+        .execute()
+    )
+    if not workspace.data:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    workspace_id = workspace.data["id"]
+
+    result = (
+        db.table("projects")
+        .insert({
+            "id": str(uuid.uuid4()),
+            "workspace_id": workspace_id,
+            "name": payload.name,
+            "github_repo_url": payload.github_repo_url,
+            "config": payload.config.model_dump(),
+        })
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create project")
+
+    log.info("project.created", project_id=result.data[0]["id"], workspace_id=workspace_id)
+    return result.data[0]
+
+
+@router.get("/{project_id}")
+async def get_project(project_id: str, authorization: str = Header(...)):
+    workspace_id = _get_workspace_id(authorization)
+    db = get_supabase()
+    result = (
+        db.table("projects")
+        .select("*, brain_snapshots(id, version, status, built_at, staleness_score, metadata)")
+        .eq("id", project_id)
+        .eq("workspace_id", workspace_id)
+        .single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return result.data
+
+
+@router.patch("/{project_id}")
+async def update_project(
+    project_id: str,
+    payload: ProjectUpdate,
+    authorization: str = Header(...),
+):
+    workspace_id = _get_workspace_id(authorization)
+    db = get_supabase()
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    result = (
+        db.table("projects")
+        .update(updates)
+        .eq("id", project_id)
+        .eq("workspace_id", workspace_id)
+        .execute()
+    )
+    return result.data[0]
+
+
+@router.delete("/{project_id}", status_code=204)
+async def delete_project(project_id: str, authorization: str = Header(...)):
+    workspace_id = _get_workspace_id(authorization)
+    db = get_supabase()
+    db.table("projects").delete().eq("id", project_id).eq("workspace_id", workspace_id).execute()
+
+=== apps/api/routers/webhooks.py ===
+import hashlib
+import hmac
+from fastapi import APIRouter, HTTPException, Header, Request
+from core.config import settings
+from core.database import get_supabase
+from workers.build_brain import build_brain_task
+from models.schemas import BrainStatus, BuildTrigger
+import structlog
+import uuid
+
+router = APIRouter()
+log = structlog.get_logger()
+
+
+def _verify_github_signature(body: bytes, signature: str) -> bool:
+    expected = hmac.new(
+        settings.GITHUB_WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature)
+
+
+@router.post("/github")
+async def github_webhook(
+    request: Request,
+    x_github_event: str = Header(...),
+    x_hub_signature_256: str = Header(...),
+):
+    body = await request.body()
+
+    if not _verify_github_signature(body, x_hub_signature_256):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    payload = await request.json()
+
+    # Only handle PR merge events
+    if x_github_event != "pull_request":
+        return {"status": "ignored", "event": x_github_event}
+
+    action = payload.get("action")
+    pr = payload.get("pull_request", {})
+    is_merged = action == "closed" and pr.get("merged", False)
+
+    if not is_merged:
+        return {"status": "ignored", "reason": "not_merged"}
+
+    repo_id = payload.get("repository", {}).get("id")
+    pr_number = str(pr.get("number"))
+    changed_files = _extract_changed_files(pr)
+
+    # Find project by GitHub repo ID
+    db = get_supabase()
+    project = (
+        db.table("projects")
+        .select("id, config")
+        .eq("github_repo_id", str(repo_id))
+        .single()
+        .execute()
+    )
+
+    if not project.data:
+        log.warning("webhook.project_not_found", repo_id=repo_id)
+        return {"status": "ignored", "reason": "project_not_found"}
+
+    project_id = project.data["id"]
+
+    # Check no active build
+    active = (
+        db.table("brain_snapshots")
+        .select("id")
+        .eq("project_id", project_id)
+        .eq("status", BrainStatus.BUILDING)
+        .execute()
+    )
+    if active.data:
+        log.info("webhook.build_skipped_active", project_id=project_id)
+        return {"status": "skipped", "reason": "build_in_progress"}
+
+    # Get next version
+    latest = (
+        db.table("brain_snapshots")
+        .select("version")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    next_version = (latest.data[0]["version"] + 1) if latest.data else 1
+
+    snapshot_id = str(uuid.uuid4())
+    db.table("brain_snapshots").insert({
+        "id": snapshot_id,
+        "project_id": project_id,
+        "version": next_version,
+        "status": BrainStatus.PENDING,
+        "trigger": BuildTrigger.PR_MERGE,
+        "trigger_ref": pr_number,
+        "staleness_score": 0,
+        "metadata": {"pr_number": pr_number, "changed_files": changed_files},
+    }).execute()
+
+    build_brain_task.delay(
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        incremental=True,
+        changed_files=changed_files,
+    )
+
+    log.info("webhook.build_triggered", project_id=project_id, pr=pr_number)
+    return {"status": "triggered", "snapshot_id": snapshot_id}
+
+
+def _extract_changed_files(pr: dict) -> list[str]:
+    """Extract file paths from PR. In real impl, call GitHub API for full list."""
+    files = pr.get("changed_files_list", [])
+    return [f.get("filename", "") for f in files if f.get("filename")]
+
+=== apps/api/workers/build_brain.py ===
+import asyncio
+import sys
+sys.path.insert(0, '/app')
+
+from celery import Celery
+from core.config import settings
+from core.database import get_supabase
+import structlog
+
+log = structlog.get_logger()
+
+redis_url = settings.REDIS_URL
+if redis_url.startswith('rediss://') and 'ssl_cert_reqs' not in redis_url:
+    redis_url = redis_url + '?ssl_cert_reqs=CERT_NONE'
+
+celery_app = Celery("cortex", broker=redis_url, backend=redis_url)
+celery_app.conf.update(
+    task_serializer="json", result_serializer="json",
+    accept_content=["json"], timezone="UTC", enable_utc=True,
+    task_track_started=True, task_acks_late=True, worker_prefetch_multiplier=1,
+    broker_use_ssl={"ssl_cert_reqs": None},
+    redis_backend_use_ssl={"ssl_cert_reqs": None},
+    task_max_retries=1,
+)
+
+
+@celery_app.task(bind=True, max_retries=1, name="build_brain")
+def build_brain_task(self, project_id: str, snapshot_id: str,
+                     incremental: bool = False, changed_files: list[str] | None = None):
+    log.info("build_brain.start", project_id=project_id, snapshot_id=snapshot_id)
+    db = get_supabase()
+
+    # Check snapshot is still valid (not manually cancelled)
+    snap = db.table("brain_snapshots").select("status").eq("id", snapshot_id).single().execute()
+    if snap.data and snap.data.get("status") == "failed":
+        log.info("build_brain.skipped_cancelled", snapshot_id=snapshot_id)
+        return
+
+    try:
+        db.table("brain_snapshots").update({"status": "building"}).eq("id", snapshot_id).execute()
+        project = db.table("projects").select("*").eq("id", project_id).single().execute()
+        if not project.data:
+            raise ValueError(f"Project {project_id} not found")
+
+        repo_url = project.data.get("github_repo_url")
+        config = project.data.get("config", {})
+        if not repo_url:
+            raise ValueError("No GitHub repo URL")
+
+        asyncio.run(_run_pipeline(
+            project_id=project_id, snapshot_id=snapshot_id,
+            repo_url=repo_url, github_token=settings.GITHUB_TOKEN,
+            branch=config.get("default_branch", "main"),
+            incremental=incremental, changed_files=changed_files or [],
+        ))
+
+    except Exception as exc:
+        log.error("build_brain.failed", project_id=project_id, error=str(exc))
+        db.table("brain_snapshots").update({
+            "status": "failed", "metadata": {"error": str(exc)[:500]},
+        }).eq("id", snapshot_id).execute()
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=120)
+
+
+async def _run_pipeline(project_id, snapshot_id, repo_url, github_token, branch, incremental, changed_files):
+    from pipeline.ingest.github import ingest_github_repo
+    from pipeline.extract.chunker import chunk_file
+    from pipeline.extract.gemini import extract_chunks_parallel
+    from pipeline.synthesise.claude import synthesise_extractions
+    from pipeline.store.brain_writer import write_brain
+
+    files = list(ingest_github_repo(repo_url=repo_url, github_token=github_token,
+                                     branch=branch, changed_files=changed_files if incremental else None))
+    log.info("pipeline.ingest.complete", file_count=len(files))
+    if not files:
+        return
+
+    all_chunks = []
+    for f in files:
+        all_chunks.extend(chunk_file(f))
+    log.info("pipeline.chunk.complete", chunk_count=len(all_chunks))
+
+    extractions = await extract_chunks_parallel(all_chunks)
+    log.info("pipeline.extract.complete", count=len(extractions))
+
+    graph = await synthesise_extractions(extractions)
+    log.info("pipeline.synthesise.complete",
+             entities=len(graph.get("entities", [])),
+             risks=len(graph.get("risks", [])))
+
+    await write_brain(graph, project_id, snapshot_id)
+    log.info("pipeline.store.complete")
+
+=== apps/web/app/api/agents/query/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function POST(request: NextRequest) {
+  const authHeader = request.headers.get('authorization')
+  const body = await request.json()
+
+  const res = await fetch(`${process.env.API_URL}/api/v1/agents/query`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': authHeader || '',
+    },
+    body: JSON.stringify(body),
+  })
+
+  const text = await res.text()
+  try {
+    return NextResponse.json(JSON.parse(text), { status: res.status })
+  } catch {
+    return NextResponse.json({ error: text }, { status: res.status })
+  }
+}
+
+=== apps/web/app/api/brain/[projectId]/build/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: { projectId: string } }
+) {
+  const authHeader = request.headers.get('authorization')
+
+  const res = await fetch(`${process.env.API_URL}/api/v1/brain/${params.projectId}/build`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': authHeader || '',
+    },
+    body: JSON.stringify({}),
+  })
+
+  const text = await res.text()
+  try {
+    return NextResponse.json(JSON.parse(text), { status: res.status })
+  } catch {
+    return NextResponse.json({ error: text }, { status: res.status })
+  }
+}
+
+=== apps/web/app/api/brain/[projectId]/graph/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { projectId: string } }
+) {
+  const { projectId } = params
+
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+
+  const [snapshotRes, nodesRes, edgesRes] = await Promise.all([
+    supabase
+      .from('brain_snapshots')
+      .select('id, version, built_at, metadata')
+      .eq('project_id', projectId)
+      .eq('status', 'complete')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single(),
+    supabase
+      .from('brain_nodes')
+      .select('id, label, node_type, summary, source_file, metadata')
+      .eq('project_id', projectId),
+    supabase
+      .from('brain_edges')
+      .select('id, from_node, to_node, edge_type, weight')
+      .eq('project_id', projectId),
+  ])
+
+  if (snapshotRes.error) {
+    return NextResponse.json({ error: 'No complete brain found' }, { status: 404 })
+  }
+
+  return NextResponse.json({
+    snapshot: snapshotRes.data,
+    nodes: nodesRes.data || [],
+    edges: edgesRes.data || [],
+  })
+}
+
+=== apps/web/app/api/keys/[keyId]/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: { keyId: string } }
+) {
+  const authHeader = request.headers.get('authorization')
+  const res = await fetch(`${process.env.API_URL}/api/v1/keys/${params.keyId}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': authHeader || '' },
+  })
+  return NextResponse.json({}, { status: res.status })
+}
+
+=== apps/web/app/api/keys/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function POST(request: NextRequest) {
+  const authHeader = request.headers.get('authorization')
+  const { name, project_id } = await request.json()
+  const res = await fetch(
+    `${process.env.API_URL}/api/v1/keys/?name=${encodeURIComponent(name)}&project_id=${project_id}`,
+    { method: 'POST', headers: { 'Authorization': authHeader || '' } }
+  )
+  const text = await res.text()
+  try { return NextResponse.json(JSON.parse(text), { status: res.status }) }
+  catch { return NextResponse.json({ error: text }, { status: res.status }) }
+}
+
+export async function GET(request: NextRequest) {
+  const authHeader = request.headers.get('authorization')
+  const { searchParams } = new URL(request.url)
+  const project_id = searchParams.get('project_id')
+  const res = await fetch(
+    `${process.env.API_URL}/api/v1/keys/?project_id=${project_id}`,
+    { headers: { 'Authorization': authHeader || '' } }
+  )
+  const text = await res.text()
+  try { return NextResponse.json(JSON.parse(text), { status: res.status }) }
+  catch { return NextResponse.json({ error: text }, { status: res.status }) }
+}
+
+=== apps/web/app/api/projects/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function POST(request: NextRequest) {
+  const authHeader = request.headers.get('authorization')
+  const body = await request.json()
+
+  console.log('Auth header:', authHeader?.substring(0, 20))
+
+  if (!authHeader) {
+    return NextResponse.json({ error: 'No auth header' }, { status: 401 })
+  }
+
+  const res = await fetch(`${process.env.API_URL}/api/v1/projects/`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': authHeader,
+    },
+    body: JSON.stringify(body),
+  })
+
+  const text = await res.text()
+  console.log('Backend response:', text.substring(0, 200))
+
+  try {
+    const data = JSON.parse(text)
+    return NextResponse.json(data, { status: res.status })
+  } catch {
+    return NextResponse.json({ error: text }, { status: res.status })
+  }
+}
+=== apps/web/app/auth/api/projects/route.ts ===
+import { createClient } from '@/lib/supabase/server'
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function POST(request: NextRequest) {
+  const supabase = createClient()
+  const { data: { session } } = await supabase.auth.getSession()
+  
+  if (!session) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const body = await request.json()
+  
+  const res = await fetch(`${process.env.API_URL}/api/v1/projects/`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify(body),
+  })
+
+  const data = await res.json()
+  return NextResponse.json(data, { status: res.status })
+}
+=== apps/web/app/auth/callback/page.tsx ===
+'use client'
+
+import { Suspense, useEffect } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { Brain } from 'lucide-react'
+
+function CallbackHandler() {
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const supabase = createClient()
+
+  useEffect(() => {
+    const code = searchParams.get('code')
+    if (code) {
+      supabase.auth.exchangeCodeForSession(code).then(({ error }) => {
+        if (!error) {
+          router.push('/dashboard')
+        } else {
+          router.push('/auth/login?error=auth_failed')
+        }
+      })
+    }
+  }, [])
+
+  return null
+}
+
+export default function AuthCallbackPage() {
+  return (
+    <div className="flex items-center justify-center h-screen bg-background">
+      <div className="flex items-center gap-2">
+        <Brain className="w-4 h-4 text-accent animate-pulse" />
+        <span className="text-sm text-foreground-2">Signing you in...</span>
+      </div>
+      <Suspense>
+        <CallbackHandler />
+      </Suspense>
+    </div>
+  )
+}
+=== apps/web/app/auth/layout.tsx ===
+export default function AuthLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="min-h-screen bg-background bg-grid flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-brain-gradient pointer-events-none" />
+      <div className="relative z-10 w-full max-w-sm">
+        {children}
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/auth/login/page.tsx ===
+'use client'
+
+import { useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { Brain, ArrowRight, Loader2 } from 'lucide-react'
+
+export default function LoginPage() {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [isSignUp, setIsSignUp] = useState(false)
+  const [error, setError] = useState('')
+  const supabase = createClient()
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setLoading(true)
+    setError('')
+
+    if (isSignUp) {
+      const { error } = await supabase.auth.signUp({ email, password })
+      if (error) { setError(error.message); setLoading(false); return }
+    }
+
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) { setError(error.message); setLoading(false); return }
+
+    if (data.session) {
+      await supabase.auth.setSession(data.session)
+      window.location.replace('/dashboard')
+    }
+  }
+
+  return (
+    <div className="animate-slide-up">
+      <div className="flex items-center gap-2 mb-10">
+        <div className="w-7 h-7 rounded bg-accent/20 border border-accent/30 flex items-center justify-center">
+          <Brain className="w-4 h-4 text-accent" />
+        </div>
+        <span className="font-display text-sm tracking-widest text-foreground uppercase">Cortex</span>
+      </div>
+
+      <div className="card p-6 space-y-5">
+        <div>
+          <h1 className="text-sm font-medium text-foreground mb-1">
+            {isSignUp ? 'Create your account' : 'Sign in to Cortex'}
+          </h1>
+          <p className="text-xs text-foreground-2">Early access only.</p>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <input
+            type="email"
+            placeholder="you@company.com"
+            value={email}
+            onChange={e => setEmail(e.target.value)}
+            className="input"
+            required
+            autoFocus
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            className="input"
+            required
+            minLength={6}
+          />
+          {error && <p className="text-xs text-danger">{error}</p>}
+          <button
+            type="submit"
+            disabled={loading || !email || !password}
+            className="btn-primary w-full justify-center"
+          >
+            {loading ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <>
+                {isSignUp ? 'Create account' : 'Sign in'}
+                <ArrowRight className="w-3.5 h-3.5" />
+              </>
+            )}
+          </button>
+        </form>
+
+        <button
+          onClick={() => { setIsSignUp(!isSignUp); setError('') }}
+          className="text-xs text-accent hover:text-accent-2 transition-colors w-full text-center"
+        >
+          {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/auth-handler.tsx ===
+'use client'
+export default function AuthHandler() { return null }
+
+=== apps/web/app/dashboard/brain/page.tsx ===
+'use client'
+
+import { useEffect, useRef, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { GitGraph, X, FileCode, AlertTriangle, Loader2 } from 'lucide-react'
+
+const COLORS: Record<string, string> = {
+  entity: '#7F77DD', risk: '#E24B4A', gap: '#EF9F27',
+  decision: '#1D9E75', flow: '#639922', dependency: '#888780',
+  model: '#378ADD', api: '#D4537E',
+}
+
+const TYPE_LABELS: Record<string, string> = {
+  entity: 'Entity', risk: 'Risk', gap: 'Gap',
+  decision: 'Decision', flow: 'Flow', dependency: 'Dependency',
+  model: 'Model', api: 'API',
+}
+
+interface BrainNode {
+  id: string; label: string; node_type: string
+  summary?: string; source_file?: string; metadata?: any
+}
+
+interface BrainEdge {
+  id: string; from_node: string; to_node: string
+  edge_type: string; weight: number
+}
+
+interface SimNode extends BrainNode {
+  x?: number; y?: number; vx?: number; vy?: number
+  fx?: number | null; fy?: number | null; index?: number
+}
+
+interface SimLink { source: SimNode; target: SimNode; edge_type: string }
+interface SelectedNode extends BrainNode { connections: number }
+
+export default function BrainMapPage() {
+  const [projects, setProjects] = useState<any[]>([])
+  const [selectedProject, setSelectedProject] = useState('')
+  const [nodes, setNodes] = useState<BrainNode[]>([])
+  const [edges, setEdges] = useState<BrainEdge[]>([])
+  const [loading, setLoading] = useState(false)
+  const [activeFilter, setActiveFilter] = useState('all')
+  const [selectedNode, setSelectedNode] = useState<SelectedNode | null>(null)
+  const svgRef = useRef<SVGSVGElement>(null)
+  const simulationRef = useRef<any>(null)
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const supabase = createClient()
+
+  useEffect(() => {
+    const load = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) { router.replace('/auth/login'); return }
+      const { data: workspace } = await supabase
+        .from('workspaces').select('id').eq('owner_id', session.user.id).single()
+      if (!workspace) return
+      const { data: projs } = await supabase
+        .from('projects').select('id, name').eq('workspace_id', workspace.id)
+      if (projs?.length) {
+        setProjects(projs)
+        const projectParam = searchParams.get('project')
+        const match = projectParam && projs.find((p: any) => p.id === projectParam)
+        setSelectedProject(match ? match.id : projs[0].id)
+      }
+    }
+    load()
+  }, [])
+
+  useEffect(() => {
+    if (!selectedProject) return
+    fetchGraph(selectedProject)
+  }, [selectedProject])
+
+  const fetchGraph = async (projectId: string) => {
+    setLoading(true)
+    setSelectedNode(null)
+    try {
+      const { data: snapshot } = await supabase
+        .from('brain_snapshots')
+        .select('id')
+        .eq('project_id', projectId)
+        .eq('status', 'complete')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single()
+
+      if (!snapshot) { setNodes([]); setEdges([]); return }
+
+      const [{ data: nodesData }, { data: edgesData }] = await Promise.all([
+        supabase.from('brain_nodes')
+          .select('id, label, node_type, summary, source_file')
+          .eq('project_id', projectId),
+        supabase.from('brain_edges')
+          .select('id, from_node, to_node, edge_type, weight')
+          .eq('project_id', projectId),
+      ])
+      setNodes(nodesData || [])
+      setEdges(edgesData || [])
+    } catch {
+      setNodes([]); setEdges([])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!nodes.length || !svgRef.current) return
+    renderGraph()
+    return () => { simulationRef.current?.stop() }
+  }, [nodes, edges, activeFilter])
+
+  const renderGraph = async () => {
+    const d3 = await import('d3')
+    const svg = d3.select(svgRef.current!)
+    svg.selectAll('*').remove()
+    const w = svgRef.current!.clientWidth || 800
+    const h = svgRef.current!.clientHeight || 600
+
+    const filteredNodes: BrainNode[] = activeFilter === 'all'
+      ? nodes : nodes.filter(n => n.node_type === activeFilter)
+    const filteredNodeIds = new Set(filteredNodes.map(n => n.id))
+    const filteredEdges = edges.filter(e =>
+      filteredNodeIds.has(e.from_node) && filteredNodeIds.has(e.to_node))
+
+    const degree: Record<string, number> = {}
+    filteredEdges.forEach(e => {
+      degree[e.from_node] = (degree[e.from_node] || 0) + 1
+      degree[e.to_node] = (degree[e.to_node] || 0) + 1
+    })
+
+    const simNodes: SimNode[] = filteredNodes.map(n => ({ ...n }))
+    const nodeById = new Map<string, SimNode>(simNodes.map(n => [n.id, n]))
+    const simLinks: SimLink[] = filteredEdges
+      .filter(e => nodeById.has(e.from_node) && nodeById.has(e.to_node))
+      .map(e => ({ source: nodeById.get(e.from_node)!, target: nodeById.get(e.to_node)!, edge_type: e.edge_type }))
+
+    svg.attr('width', w).attr('height', h)
+    const g = svg.append('g')
+    const zoom = d3.zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.1, 6])
+      .on('zoom', e => g.attr('transform', e.transform))
+    svg.call(zoom)
+
+    const sim = d3.forceSimulation<SimNode>(simNodes)
+      .force('link', d3.forceLink<SimNode, SimLink>(simLinks).id(d => d.id).distance(90).strength(0.35))
+      .force('charge', d3.forceManyBody().strength(-250))
+      .force('center', d3.forceCenter(w / 2, h / 2))
+      .force('collide', d3.forceCollide<SimNode>(22))
+    simulationRef.current = sim
+
+    const link = g.append('g')
+      .selectAll<SVGLineElement, SimLink>('line').data(simLinks).join('line')
+      .attr('stroke', d => COLORS[d.source.node_type] || '#888')
+      .attr('stroke-opacity', 0.4).attr('stroke-width', 1.5)
+
+    const drag = d3.drag<SVGGElement, SimNode>()
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y })
+      .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null })
+
+    const node = g.append('g')
+      .selectAll<SVGGElement, SimNode>('g').data(simNodes).join('g')
+      .style('cursor', 'pointer').call(drag)
+      .on('click', (_e, d) => setSelectedNode({ ...d, connections: degree[d.id] || 0 }))
+      .on('mouseover', (_e, d) => {
+        link.attr('stroke-opacity', (l: SimLink) =>
+          l.source.id === d.id || l.target.id === d.id ? 0.85 : 0.04)
+        node.selectAll<SVGCircleElement, SimNode>('circle').attr('opacity', (n: SimNode) => {
+          if (n.id === d.id) return 1
+          const connected = filteredEdges.some(e =>
+            (e.from_node === d.id && e.to_node === n.id) || (e.to_node === d.id && e.from_node === n.id))
+          return connected ? 1 : 0.15
+        })
+      })
+      .on('mouseout', () => { link.attr('stroke-opacity', 0.2); node.selectAll('circle').attr('opacity', 1) })
+
+    node.append('circle')
+      .attr('r', d => Math.max(5, 5 + (degree[d.id] || 0) * 0.8))
+      .attr('fill', d => COLORS[d.node_type] || '#888')
+      .attr('fill-opacity', 0.8)
+      .attr('stroke', d => COLORS[d.node_type] || '#888')
+      .attr('stroke-width', 1.5).attr('stroke-opacity', 0.35)
+
+    node.append('text')
+      .text(d => d.label.length > 16 ? d.label.slice(0, 15) + '…' : d.label)
+      .attr('dy', d => -(Math.max(5, 5 + (degree[d.id] || 0) * 0.8)) - 5)
+      .attr('text-anchor', 'middle').attr('font-size', '10px')
+      .attr('fill', '#9a9890').attr('pointer-events', 'none')
+
+    sim.on('tick', () => {
+      link.attr('x1', d => d.source.x ?? 0).attr('y1', d => d.source.y ?? 0)
+        .attr('x2', d => d.target.x ?? 0).attr('y2', d => d.target.y ?? 0)
+      node.attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`)
+    })
+  }
+
+  const nodeTypes = ['all', ...Array.from(new Set(nodes.map(n => n.node_type)))]
+  const typeCounts = nodes.reduce((acc, n) => ({ ...acc, [n.node_type]: (acc[n.node_type] || 0) + 1 }), {} as Record<string, number>)
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0f0f13' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px', background: '#17171e', borderBottom: '0.5px solid #2e2e3a', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <GitGraph style={{ width: 14, height: 14, color: '#7F77DD' }} />
+          <span style={{ fontSize: 12, fontWeight: 500, color: '#e8e6df' }}>Brain Map</span>
+          {nodes.length > 0 && <span style={{ fontSize: 11, color: '#888780' }}>{nodes.length} nodes · {edges.length} edges</span>}
+        </div>
+        {projects.length > 1 && (
+          <select value={selectedProject} onChange={e => setSelectedProject(e.target.value)}
+            style={{ fontSize: 12, padding: '4px 8px', background: '#1e1e2a', border: '0.5px solid #2e2e3a', borderRadius: 6, color: '#e8e6df' }}>
+            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        )}
+      </div>
+
+      {nodes.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, padding: '8px 16px', background: '#17171e', borderBottom: '0.5px solid #2e2e3a', flexShrink: 0, flexWrap: 'wrap' }}>
+          {nodeTypes.map(type => (
+            <button key={type} onClick={() => setActiveFilter(type)} style={{
+              padding: '3px 10px', borderRadius: 999, fontSize: 11, cursor: 'pointer',
+              background: activeFilter === type ? '#1e1e2a' : 'transparent',
+              border: `0.5px solid ${activeFilter === type ? '#534AB7' : '#2e2e3a'}`,
+              color: activeFilter === type ? '#e8e6df' : '#888780',
+              textTransform: 'uppercase', letterSpacing: '0.06em',
+            }}>
+              {type === 'all' ? `All (${nodes.length})` : `${type} (${typeCounts[type] || 0})`}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div style={{ flex: 1, display: 'flex', position: 'relative', overflow: 'hidden' }}>
+        {loading ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12 }}>
+            <Loader2 style={{ width: 20, height: 20, color: '#7F77DD' }} className="animate-spin" />
+            <span style={{ fontSize: 12, color: '#888780' }}>Loading brain graph…</span>
+          </div>
+        ) : nodes.length === 0 ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 8 }}>
+            <GitGraph style={{ width: 32, height: 32, color: '#2e2e3a' }} />
+            <span style={{ fontSize: 13, color: '#888780' }}>No brain built yet</span>
+            <span style={{ fontSize: 11, color: '#534841' }}>Build the brain from the project page first</span>
+          </div>
+        ) : (
+          <svg ref={svgRef} style={{ flex: 1, width: '100%', height: '100%' }} />
+        )}
+
+        {nodes.length > 0 && (
+          <div style={{ position: 'absolute', bottom: 20, left: 20, background: '#17171e', border: '0.5px solid #2e2e3a', borderRadius: 10, padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {Object.entries(COLORS).filter(([type]) => typeCounts[type] > 0).map(([type, color]) => (
+              <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: '#888780' }}>
+                <div style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                {TYPE_LABELS[type] || type}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {nodes.length > 0 && (
+          <div style={{ position: 'absolute', bottom: 20, right: selectedNode ? 276 : 16, fontSize: 10, color: '#444441' }}>
+            scroll to zoom · drag to pan · click node for details
+          </div>
+        )}
+
+        {selectedNode && (
+          <div style={{ width: 256, background: '#17171e', borderLeft: '0.5px solid #2e2e3a', padding: 20, overflowY: 'auto', flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: COLORS[selectedNode.node_type] || '#888', flexShrink: 0 }} />
+                <span style={{ fontSize: 10, color: COLORS[selectedNode.node_type], textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                  {TYPE_LABELS[selectedNode.node_type] || selectedNode.node_type}
+                </span>
+              </div>
+              <button onClick={() => setSelectedNode(null)} style={{ background: 'none', border: 'none', color: '#888780', cursor: 'pointer', padding: 0 }}>
+                <X style={{ width: 14, height: 14 }} />
+              </button>
+            </div>
+            <p style={{ fontSize: 13, fontWeight: 500, color: '#e8e6df', marginBottom: 10, lineHeight: 1.4 }}>{selectedNode.label}</p>
+            {selectedNode.summary && (
+              <p style={{ fontSize: 11, color: '#888780', lineHeight: 1.6, marginBottom: 12 }}>{selectedNode.summary}</p>
+            )}
+            {selectedNode.source_file && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12 }}>
+                <FileCode style={{ width: 11, height: 11, color: '#534AB7', flexShrink: 0 }} />
+                <span style={{ fontSize: 10, color: '#534AB7', fontFamily: 'monospace' }}>{selectedNode.source_file}</span>
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ background: '#1e1e2a', borderRadius: 6, padding: '6px 10px', flex: 1 }}>
+                <div style={{ fontSize: 10, color: '#888780', marginBottom: 2 }}>connections</div>
+                <div style={{ fontSize: 16, fontWeight: 500, color: '#e8e6df' }}>{selectedNode.connections}</div>
+              </div>
+              {selectedNode.node_type === 'risk' && (
+                <div style={{ background: 'rgba(226,75,74,0.1)', borderRadius: 6, padding: '6px 10px', flex: 1, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <AlertTriangle style={{ width: 10, height: 10, color: '#E24B4A' }} />
+                  <span style={{ fontSize: 10, color: '#E24B4A' }}>Risk</span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/intake/page.tsx ===
+'use client'
+
+import { Inbox, Brain } from 'lucide-react'
+
+export default function IntakePage() {
+  return (
+    <div className="p-8 max-w-3xl mx-auto">
+      <div className="flex items-center gap-3 mb-8">
+        <Inbox className="w-4 h-4 text-accent" />
+        <h1 className="text-base font-medium text-foreground">Intake</h1>
+      </div>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <div className="w-12 h-12 rounded-lg bg-surface-2 border border-border flex items-center justify-center mb-4">
+          <Brain className="w-5 h-5 text-muted" />
+        </div>
+        <h3 className="text-sm font-medium text-foreground mb-1">Coming soon</h3>
+        <p className="text-xs text-foreground-2 max-w-xs">
+          Submit feature requests. Brain cross-checks against the codebase — flags duplicates, surfaces feasibility, auto-routes to the right team.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/layout.tsx ===
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import Sidebar from '@/components/layout/Sidebar'
+import { Brain } from 'lucide-react'
+
+export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+  const router = useRouter()
+  const supabase = createClient()
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) { router.replace('/auth/login'); return }
+      setUser(session.user)
+      setLoading(false)
+    })
+  }, [])
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-screen bg-background">
+      <Brain className="w-4 h-4 text-accent animate-pulse" />
+    </div>
+  )
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-background">
+      <Sidebar user={user} />
+      <main className="flex-1 overflow-y-auto">
+        {children}
+      </main>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/page.tsx ===
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { Plus, Brain, GitBranch, Clock, AlertTriangle } from 'lucide-react'
+import Link from 'next/link'
+
+export default function DashboardPage() {
+  const [user, setUser] = useState<any>(null)
+  const [projects, setProjects] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const router = useRouter()
+  const supabase = createClient()
+
+  useEffect(() => {
+    const load = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) { router.replace('/auth/login'); return }
+      setUser(session.user)
+
+      // Get workspace
+      const { data: workspace } = await supabase
+        .from('workspaces')
+        .select('id')
+        .eq('owner_id', session.user.id)
+        .single()
+
+      if (!workspace) { setLoading(false); return }
+
+      // Get projects
+      const { data: projectData } = await supabase
+        .from('projects')
+        .select('*, brain_snapshots(id, version, status, built_at, staleness_score)')
+        .eq('workspace_id', workspace.id)
+        .order('created_at', { ascending: false })
+
+      setProjects(projectData || [])
+      setLoading(false)
+    }
+    load()
+  }, [])
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-background">
+        <Brain className="w-4 h-4 text-accent animate-pulse" />
+      </div>
+    )
+  }
+
+  return (
+    <div className="p-8 max-w-5xl mx-auto">
+      <div className="flex items-center justify-between mb-8">
+        <div>
+          <h1 className="text-base font-medium text-foreground">Projects</h1>
+          <p className="text-xs text-foreground-2 mt-0.5">
+            {projects.length} project{projects.length !== 1 ? 's' : ''}
+          </p>
+        </div>
+        <Link href="/dashboard/projects/new" className="btn-primary">
+          <Plus className="w-3.5 h-3.5" />
+          New project
+        </Link>
+      </div>
+
+      {projects.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-24 text-center">
+          <div className="w-12 h-12 rounded-lg bg-surface-2 border border-border flex items-center justify-center mb-4">
+            <Brain className="w-5 h-5 text-muted" />
+          </div>
+          <h3 className="text-sm font-medium text-foreground mb-1">No projects yet</h3>
+          <p className="text-xs text-foreground-2 mb-6 max-w-xs">
+            Connect a GitHub repo to build your first Product Brain.
+          </p>
+          <Link href="/dashboard/projects/new" className="btn-primary">
+            <Plus className="w-3.5 h-3.5" />
+            Create first project
+          </Link>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {projects.map(project => (
+            <ProjectCard key={project.id} project={project} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ProjectCard({ project }: { project: any }) {
+  const latestSnapshot = project.brain_snapshots?.[0]
+  const isBuilding = latestSnapshot?.status === 'building' || latestSnapshot?.status === 'pending'
+  const isComplete = latestSnapshot?.status === 'complete'
+  const staleness = latestSnapshot?.staleness_score || 0
+
+  return (
+    <Link href={`/dashboard/projects/${project.id}`}>
+      <div className="card p-5 hover:border-border-2 transition-colors duration-150 group cursor-pointer">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h3 className="text-sm font-medium text-foreground group-hover:text-accent transition-colors">
+              {project.name}
+            </h3>
+            {project.github_repo_url && (
+              <div className="flex items-center gap-1 mt-1">
+                <GitBranch className="w-3 h-3 text-muted" />
+                <span className="text-2xs text-muted font-mono">
+                  {project.github_repo_url.replace('https://github.com/', '')}
+                </span>
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            {isBuilding && <span className="badge-accent"><span className="status-dot bg-accent animate-pulse-slow" />Building</span>}
+            {isComplete && staleness < 0.3 && <span className="badge-success"><span className="status-dot bg-success" />Live</span>}
+            {isComplete && staleness >= 0.3 && <span className="badge-warning"><span className="status-dot bg-warning" />Stale</span>}
+            {!latestSnapshot && <span className="badge-muted">No Brain</span>}
+          </div>
+        </div>
+        {latestSnapshot && (
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-1.5">
+              <Brain className="w-3 h-3 text-muted" />
+              <span className="text-2xs text-foreground-2">v{latestSnapshot.version}</span>
+            </div>
+            {latestSnapshot.built_at && (
+              <div className="flex items-center gap-1.5">
+                <Clock className="w-3 h-3 text-muted" />
+                <span className="text-2xs text-foreground-2">{new Date(latestSnapshot.built_at).toLocaleDateString()}</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Link>
+  )
+}
+
+=== apps/web/app/dashboard/prd/page.tsx ===
+'use client'
+
+import { FileText, Brain } from 'lucide-react'
+
+export default function PRDPage() {
+  return (
+    <div className="p-8 max-w-3xl mx-auto">
+      <div className="flex items-center gap-3 mb-8">
+        <FileText className="w-4 h-4 text-accent" />
+        <h1 className="text-base font-medium text-foreground">Generate PRD</h1>
+      </div>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <div className="w-12 h-12 rounded-lg bg-surface-2 border border-border flex items-center justify-center mb-4">
+          <Brain className="w-5 h-5 text-muted" />
+        </div>
+        <h3 className="text-sm font-medium text-foreground mb-1">Coming soon</h3>
+        <p className="text-xs text-foreground-2 max-w-xs">
+          Generate context-aware PRDs. Brain surfaces what the codebase already supports — you answer only the business questions.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/projects/[id]/page.tsx ===
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter, useParams } from 'next/navigation'
+import Link from 'next/link'
+import { Brain, RefreshCw, Search, GitGraph, ArrowLeft, AlertCircle, Clock } from 'lucide-react'
+
+export default function ProjectPage() {
+  const [project, setProject] = useState<any>(null)
+  const [snapshot, setSnapshot] = useState<any>(null)
+  const [building, setBuilding] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const router = useRouter()
+  const params = useParams()
+  const id = params.id as string
+  const supabase = createClient()
+
+  useEffect(() => {
+    const load = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) { router.replace('/auth/login'); return }
+
+      const { data: proj } = await supabase
+        .from('projects').select('*').eq('id', id).single()
+      if (!proj) { router.replace('/dashboard'); return }
+      setProject(proj)
+
+      await loadSnapshot(id)
+      setLoading(false)
+
+      const channel = supabase.channel(`snapshot-${id}`)
+        .on('postgres_changes', {
+          event: '*', schema: 'public', table: 'brain_snapshots',
+          filter: `project_id=eq.${id}`,
+        }, () => loadSnapshot(id))
+        .subscribe()
+      return () => { supabase.removeChannel(channel) }
+    }
+    load()
+  }, [id])
+
+  const loadSnapshot = async (projectId: string) => {
+    const { data } = await supabase
+      .from('brain_snapshots')
+      .select('*')
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+    setSnapshot(data?.[0] || null)
+    if (data?.[0]?.status === 'building') setBuilding(true)
+    else setBuilding(false)
+  }
+
+  const handleBuild = async () => {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) return
+    setBuilding(true)
+    try {
+      const res = await fetch(`/api/brain/${id}/build`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${session.access_token}` },
+      })
+      if (!res.ok) {
+        const err = await res.text()
+        console.error('Build failed:', err)
+        setBuilding(false)
+      }
+    } catch (e) {
+      console.error('Build error:', e)
+      setBuilding(false)
+    }
+  }
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-full">
+      <Brain className="w-4 h-4 text-accent animate-pulse" />
+    </div>
+  )
+
+  const meta = snapshot?.metadata || {}
+  const isComplete = snapshot?.status === 'complete'
+  const isFailed = snapshot?.status === 'failed'
+  const byType = meta.by_type || {}
+  const productSummary = meta.product_summary || {}
+  const techStack = productSummary.tech_stack || []
+
+  return (
+    <div className="p-8 max-w-3xl mx-auto">
+      <div className="flex items-center gap-3 mb-8">
+        <Link href="/dashboard" className="text-foreground-2 hover:text-foreground transition-colors">
+          <ArrowLeft className="w-4 h-4" />
+        </Link>
+        <div className="flex-1">
+          <h1 className="text-base font-medium text-foreground">{project?.name}</h1>
+          <p className="text-xs text-foreground-2 mt-0.5">{project?.github_repo_url?.replace('https://github.com/', '')}</p>
+        </div>
+        <button
+          onClick={handleBuild}
+          disabled={building}
+          className="btn-primary flex items-center gap-2"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${building ? 'animate-spin' : ''}`} />
+          {building ? 'Building…' : isComplete ? 'Rebuild Brain' : 'Build Brain'}
+        </button>
+      </div>
+
+      <div className="card p-5 mb-6">
+        <div className="flex items-center gap-3 mb-4">
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${isComplete ? 'bg-accent/10 border border-accent/20' : 'bg-surface-2 border border-border'}`}>
+            <Brain className={`w-4 h-4 ${isComplete ? 'text-accent' : 'text-muted'}`} />
+          </div>
+          <div>
+            <p className="text-sm font-medium text-foreground">
+              {building ? 'Building Brain…' : isComplete ? 'Brain active' : isFailed ? 'Build failed' : 'No brain yet'}
+            </p>
+            {snapshot?.version && (
+              <p className="text-xs text-foreground-2">
+                v{snapshot.version}
+                {snapshot.built_at && ` · Built ${new Date(snapshot.built_at).toLocaleDateString()}`}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {isFailed && (
+          <div className="flex items-center gap-2 p-3 bg-danger/5 border border-danger/20 rounded-lg mb-4">
+            <AlertCircle className="w-3.5 h-3.5 text-danger flex-shrink-0" />
+            <p className="text-xs text-danger">{meta?.error || 'Build failed'}</p>
+          </div>
+        )}
+
+        {building && (
+          <div className="flex items-center gap-2 p-3 bg-accent/5 border border-accent/20 rounded-lg mb-4">
+            <Clock className="w-3.5 h-3.5 text-accent flex-shrink-0 animate-pulse" />
+            <p className="text-xs text-accent">Building knowledge graph — this takes 5-15 minutes</p>
+          </div>
+        )}
+
+        {isComplete && Object.keys(byType).length > 0 && (
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            {Object.entries(byType).map(([type, count]) => (
+              <div key={type} className="bg-surface-2 rounded-lg p-3">
+                <p className="text-lg font-medium text-foreground">{count as number}</p>
+                <p className="text-xs text-foreground-2 capitalize">{type}</p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {isComplete && productSummary.what_it_does && (
+          <p className="text-xs text-foreground-2 leading-relaxed mb-3">{productSummary.what_it_does}</p>
+        )}
+
+        {isComplete && techStack.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {techStack.map((t: string) => (
+              <span key={t} className="badge-muted">{t}</span>
+            ))}
+            {productSummary.architecture_pattern && (
+              <span className="badge-accent">{productSummary.architecture_pattern}</span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {isComplete && (
+        <div className="grid grid-cols-2 gap-4">
+          <Link href={`/dashboard/query?project=${id}`} className="card p-5 hover:border-border-2 transition-colors group block">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center">
+                <Search className="w-4 h-4 text-accent" />
+              </div>
+              <p className="text-sm font-medium text-foreground">Query Brain</p>
+            </div>
+            <p className="text-xs text-foreground-2 leading-relaxed">
+              Ask questions about the codebase in plain English. Get answers grounded in the knowledge graph.
+            </p>
+          </Link>
+
+          <Link href={`/dashboard/brain?project=${id}`} className="card p-5 hover:border-border-2 transition-colors group block">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 rounded-lg bg-surface-2 border border-border flex items-center justify-center">
+                <GitGraph className="w-4 h-4 text-foreground-2 group-hover:text-accent transition-colors" />
+              </div>
+              <p className="text-sm font-medium text-foreground">Brain Map</p>
+            </div>
+            <p className="text-xs text-foreground-2 leading-relaxed">
+              Visualise the knowledge graph. Explore nodes, edges and communities interactively.
+            </p>
+          </Link>
+        </div>
+      )}
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/projects/new/page.tsx ===
+'use client'
+
+import { useState, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+import { ArrowLeft, Github, Loader2, ArrowRight } from 'lucide-react'
+import Link from 'next/link'
+import { createClient } from '@/lib/supabase/client'
+
+export default function NewProjectPage() {
+  const router = useRouter()
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [form, setForm] = useState({
+    name: '',
+    github_repo_url: '',
+    default_branch: 'main',
+  })
+  const supabase = createClient()
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      console.log('Session:', data.session?.user?.email, 'Token:', data.session?.access_token?.substring(0, 20))
+    })
+  }, [])
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!form.name || !form.github_repo_url) return
+    setLoading(true)
+    setError('')
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+
+      if (!session) {
+        setError('Not logged in. Please refresh and try again.')
+        setLoading(false)
+        return
+      }
+
+      const res = await fetch(`/api/projects`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          name: form.name,
+          github_repo_url: form.github_repo_url,
+          config: { default_branch: form.default_branch },
+        }),
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        throw new Error(data.detail || data.error || 'Failed to create project')
+      }
+
+      window.location.href = `/dashboard/projects/${data.id}`
+    } catch (err: any) {
+      setError(err.message)
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="p-8 max-w-lg mx-auto">
+      <Link href="/dashboard" className="btn-ghost mb-6 -ml-1 inline-flex">
+        <ArrowLeft className="w-3.5 h-3.5" />
+        Back
+      </Link>
+
+      <h1 className="text-base font-medium text-foreground mb-1">New project</h1>
+      <p className="text-xs text-foreground-2 mb-8">
+        Connect a GitHub repo to start building your Product Brain.
+      </p>
+
+      <form onSubmit={handleSubmit} className="space-y-5">
+        <div className="space-y-1.5">
+          <label className="label">Project name</label>
+          <input
+            type="text"
+            className="input"
+            placeholder="Payments App"
+            value={form.name}
+            onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+            required
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="label">GitHub repo URL</label>
+          <div className="relative">
+            <Github className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted" />
+            <input
+              type="url"
+              className="input pl-8"
+              placeholder="https://github.com/org/repo"
+              value={form.github_repo_url}
+              onChange={e => setForm(f => ({ ...f, github_repo_url: e.target.value }))}
+              required
+            />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="label">Default branch</label>
+          <input
+            type="text"
+            className="input"
+            placeholder="main"
+            value={form.default_branch}
+            onChange={e => setForm(f => ({ ...f, default_branch: e.target.value }))}
+          />
+        </div>
+
+        {error && (
+          <p className="text-xs text-danger">{error}</p>
+        )}
+
+        <button
+          type="submit"
+          disabled={loading || !form.name || !form.github_repo_url}
+          className="btn-primary w-full justify-center"
+        >
+          {loading ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <>
+              Create project
+              <ArrowRight className="w-3.5 h-3.5" />
+            </>
+          )}
+        </button>
+      </form>
+
+      <div className="mt-8 card p-4 space-y-2">
+        <p className="text-xs font-medium text-foreground">After creating:</p>
+        <ol className="space-y-1.5 text-xs text-foreground-2 list-decimal list-inside">
+          <li>Add a <code className="text-accent font-mono">.cortexignore</code> file to exclude sensitive paths</li>
+          <li>Trigger your first Brain build from the project dashboard</li>
+          <li>Build takes 2–10 minutes depending on repo size</li>
+        </ol>
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/query/page.tsx ===
+'use client'
+
+import { useEffect, useState, useRef } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { Brain, Send, Loader2, AlertTriangle, FileCode } from 'lucide-react'
+
+interface Message {
+  role: 'user' | 'assistant'
+  content: string
+  sources?: Array<{ label: string; type: string; source_file?: string }>
+  staleness_warning?: string
+}
+
+const SUGGESTED = [
+  "What does this product do?",
+  "What are the biggest risks in this codebase?",
+  "What are the main user flows?",
+  "What architectural decisions were made?",
+  "What's missing or undocumented?",
+  "How is state managed?",
+]
+
+export default function QueryPage() {
+  const [projects, setProjects] = useState<any[]>([])
+  const [selectedProject, setSelectedProject] = useState<string>('')
+  const [messages, setMessages] = useState<Message[]>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [session, setSession] = useState<any>(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const supabase = createClient()
+
+  useEffect(() => {
+    const load = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) { router.replace('/auth/login'); return }
+      setSession(session)
+
+      const { data: workspace } = await supabase
+        .from('workspaces').select('id').eq('owner_id', session.user.id).single()
+      if (!workspace) return
+
+      const { data: projs } = await supabase
+        .from('projects').select('id, name').eq('workspace_id', workspace.id)
+      if (projs?.length) {
+        setProjects(projs)
+        const projectParam = searchParams.get('project')
+        const match = projectParam && projs.find(p => p.id === projectParam)
+        setSelectedProject(match ? match.id : projs[0].id)
+      }
+    }
+    load()
+  }, [])
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  const handleSend = async (question?: string) => {
+    const q = question || input.trim()
+    if (!q || !selectedProject || loading) return
+    setInput('')
+    setMessages(prev => [...prev, { role: 'user', content: q }])
+    setLoading(true)
+    try {
+      const res = await fetch('/api/agents/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session?.access_token}` },
+        body: JSON.stringify({ project_id: selectedProject, question: q }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.detail || data.error || 'Something went wrong.' }])
+      } else {
+        setMessages(prev => [...prev, { role: 'assistant', content: data.answer, sources: data.source_nodes, staleness_warning: data.staleness_warning }])
+      }
+    } catch {
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to reach the Brain.' }])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col h-screen">
+      <div className="flex items-center justify-between px-8 py-4 border-b border-border flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <Brain className="w-4 h-4 text-accent" />
+          <h1 className="text-sm font-medium text-foreground">Query Brain</h1>
+        </div>
+        {projects.length > 1 && (
+          <select value={selectedProject} onChange={e => setSelectedProject(e.target.value)} className="input w-48 text-xs">
+            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        )}
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-8 py-6 space-y-6">
+        {messages.length === 0 ? (
+          <div className="max-w-2xl mx-auto">
+            <div className="text-center mb-8">
+              <div className="w-12 h-12 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center mx-auto mb-4">
+                <Brain className="w-5 h-5 text-accent" />
+              </div>
+              <h2 className="text-sm font-medium text-foreground mb-1">Ask the Brain</h2>
+              <p className="text-xs text-foreground-2">Ask anything about your codebase. The Brain answers from your knowledge graph.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {SUGGESTED.map(q => (
+                <button key={q} onClick={() => handleSend(q)} className="card p-3 text-left text-xs text-foreground-2 hover:text-foreground hover:border-border-2 transition-colors">
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="max-w-2xl mx-auto space-y-6">
+            {messages.map((msg, i) => (
+              <div key={i} className={msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+                <div className="max-w-[85%]">
+                  {msg.role === 'user' ? (
+                    <div className="bg-accent/10 border border-accent/20 rounded-lg px-4 py-3">
+                      <p className="text-sm text-foreground">{msg.content}</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {msg.staleness_warning && (
+                        <div className="flex items-center gap-2 text-xs text-warning">
+                          <AlertTriangle className="w-3 h-3 flex-shrink-0" />{msg.staleness_warning}
+                        </div>
+                      )}
+                      <div className="card p-4">
+                        <div className="flex items-center gap-2 mb-3">
+                          <Brain className="w-3.5 h-3.5 text-accent flex-shrink-0" />
+                          <span className="text-xs text-accent font-medium uppercase tracking-wider">Brain</span>
+                        </div>
+                        <p className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+                      </div>
+                      {msg.sources && msg.sources.length > 0 && (
+                        <div className="space-y-1">
+                          <p className="text-xs text-muted uppercase tracking-wider">Sources</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {msg.sources.slice(0, 6).map((s, j) => (
+                              <div key={j} className="flex items-center gap-1 badge-muted">
+                                {s.source_file && <FileCode className="w-2.5 h-2.5" />}
+                                <span className="text-xs">{s.label}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            {loading && (
+              <div className="flex justify-start">
+                <div className="card px-4 py-3 flex items-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 text-accent animate-spin" />
+                  <span className="text-xs text-foreground-2">Thinking…</span>
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
+          </div>
+        )}
+      </div>
+
+      <div className="px-8 py-4 border-t border-border flex-shrink-0">
+        <div className="max-w-2xl mx-auto flex gap-2">
+          <input
+            type="text" className="input flex-1"
+            placeholder="Ask anything about your codebase…"
+            value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
+            disabled={loading}
+          />
+          <button onClick={() => handleSend()} disabled={loading || !input.trim() || !selectedProject} className="btn-primary px-3">
+            {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/dashboard/settings/page.tsx ===
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { Key, Plus, Copy, Trash2, CheckCircle2 } from 'lucide-react'
+
+export default function SettingsPage() {
+  const [session, setSession] = useState<any>(null)
+  const [projects, setProjects] = useState<any[]>([])
+  const [selectedProject, setSelectedProject] = useState('')
+  const [keys, setKeys] = useState<any[]>([])
+  const [newKeyName, setNewKeyName] = useState('')
+  const [generatedKey, setGeneratedKey] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const router = useRouter()
+  const supabase = createClient()
+
+  useEffect(() => {
+    const load = async () => {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) { router.replace('/auth/login'); return }
+      setSession(session)
+
+      const { data: workspace } = await supabase
+        .from('workspaces').select('id').eq('owner_id', session.user.id).single()
+      if (!workspace) return
+
+      const { data: projs } = await supabase
+        .from('projects').select('id, name').eq('workspace_id', workspace.id)
+      if (projs?.length) {
+        setProjects(projs)
+        setSelectedProject(projs[0].id)
+        loadKeys(projs[0].id, session.access_token)
+      }
+    }
+    load()
+  }, [])
+
+  const loadKeys = async (projectId: string, token: string) => {
+    const res = await fetch(`/api/keys?project_id=${projectId}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    if (res.ok) setKeys(await res.json())
+  }
+
+  const handleCreate = async () => {
+    if (!newKeyName.trim() || !selectedProject) return
+    setLoading(true)
+    const res = await fetch('/api/keys', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session?.access_token}`,
+      },
+      body: JSON.stringify({ name: newKeyName, project_id: selectedProject }),
+    })
+    const data = await res.json()
+    if (res.ok) {
+      setGeneratedKey(data.key)
+      setNewKeyName('')
+      loadKeys(selectedProject, session?.access_token)
+    }
+    setLoading(false)
+  }
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(generatedKey)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  const handleRevoke = async (keyId: string) => {
+    await fetch(`/api/keys/${keyId}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${session?.access_token}` },
+    })
+    loadKeys(selectedProject, session?.access_token)
+  }
+
+  return (
+    <div className="p-8 max-w-2xl mx-auto space-y-8">
+      <div>
+        <h1 className="text-base font-medium text-foreground mb-1">Settings</h1>
+        <p className="text-xs text-foreground-2">Manage API keys for the Cortex connector.</p>
+      </div>
+
+      {/* Generated key alert */}
+      {generatedKey && (
+        <div className="card p-4 border-success/30 bg-success/5 space-y-3">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-success" />
+            <p className="text-sm font-medium text-foreground">API key generated — copy it now</p>
+          </div>
+          <p className="text-2xs text-foreground-2">This key will never be shown again.</p>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 text-xs font-mono bg-surface-2 px-3 py-2 rounded text-accent truncate">
+              {generatedKey}
+            </code>
+            <button onClick={handleCopy} className="btn-secondary px-3 py-2">
+              {copied ? <CheckCircle2 className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
+          </div>
+          <div className="card-2 p-3 space-y-1">
+            <p className="text-2xs font-medium text-foreground">Usage:</p>
+            <code className="text-2xs font-mono text-foreground-2 block">
+              curl -X POST https://cortex-api-kwfy.onrender.com/api/v1/connector/query \
+            </code>
+            <code className="text-2xs font-mono text-foreground-2 block">
+              {'  '}-H "x-cortex-key: {generatedKey.substring(0, 20)}..." \
+            </code>
+            <code className="text-2xs font-mono text-foreground-2 block">
+              {'  '}-d '{"{"}\"question\": \"What does this product do?\"{"}"}' 
+            </code>
+          </div>
+        </div>
+      )}
+
+      {/* Create new key */}
+      <div className="card p-5 space-y-4">
+        <div className="flex items-center gap-2">
+          <Key className="w-4 h-4 text-accent" />
+          <h2 className="text-sm font-medium text-foreground">Generate API key</h2>
+        </div>
+
+        {projects.length > 1 && (
+          <div className="space-y-1.5">
+            <label className="label">Project</label>
+            <select
+              value={selectedProject}
+              onChange={e => { setSelectedProject(e.target.value); loadKeys(e.target.value, session?.access_token) }}
+              className="input"
+            >
+              {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+        )}
+
+        <div className="space-y-1.5">
+          <label className="label">Key name</label>
+          <input
+            type="text"
+            className="input"
+            placeholder="e.g. cursor-plugin, slack-bot"
+            value={newKeyName}
+            onChange={e => setNewKeyName(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleCreate()}
+          />
+        </div>
+
+        <button
+          onClick={handleCreate}
+          disabled={loading || !newKeyName.trim()}
+          className="btn-primary"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          {loading ? 'Generating…' : 'Generate key'}
+        </button>
+      </div>
+
+      {/* Existing keys */}
+      {keys.length > 0 && (
+        <div className="space-y-3">
+          <h2 className="label">Active keys</h2>
+          {keys.map(k => (
+            <div key={k.id} className="card-2 px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Key className="w-3.5 h-3.5 text-muted" />
+                <div>
+                  <p className="text-sm text-foreground">{k.name}</p>
+                  <p className="text-2xs text-muted font-mono">{k.key_prefix}••••••••</p>
+                </div>
+              </div>
+              <button
+                onClick={() => handleRevoke(k.id)}
+                className="btn-ghost text-danger hover:text-danger"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Connector docs */}
+      <div className="card p-5 space-y-3">
+        <h2 className="text-sm font-medium text-foreground">Connector API</h2>
+        <p className="text-xs text-foreground-2">Use your API key to query the Brain from any tool.</p>
+        <div className="space-y-2">
+          {[
+            { label: 'Query endpoint', value: 'POST /api/v1/connector/query' },
+            { label: 'Auth header', value: 'x-cortex-key: ctx_...' },
+            { label: 'Base URL', value: 'https://cortex-api-kwfy.onrender.com' },
+          ].map(({ label, value }) => (
+            <div key={label} className="flex items-center justify-between">
+              <span className="text-2xs text-foreground-2">{label}</span>
+              <code className="text-2xs font-mono text-accent">{value}</code>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+=== apps/web/app/layout.tsx ===
+import type { Metadata } from 'next'
+import { Inter } from 'next/font/google'
+import { JetBrains_Mono } from 'next/font/google'
+import './globals.css'
+
+const inter = Inter({ subsets: ['latin'], variable: '--font-sans' })
+const jetbrainsMono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-mono' })
+
+export const metadata: Metadata = {
+  title: { default: 'Cortex', template: '%s · Cortex' },
+  description: "Your product's living brain.",
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || 'https://cortex-omega-one.vercel.app'),
+}
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en" className="dark" suppressHydrationWarning>
+      <body className={`${inter.variable} ${jetbrainsMono.variable} font-sans bg-background text-foreground antialiased`}>
+        {children}
+      </body>
+    </html>
+  )
+}
+=== apps/web/app/page.tsx ===
+import { redirect } from 'next/navigation'
+import { createClient } from '@/lib/supabase/server'
+
+export default async function RootPage() {
+  const supabase = createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  if (user) {
+    redirect('/dashboard')
+  } else {
+    redirect('/auth/login')
+  }
+}
+
+=== apps/web/components/brain/BrainNodeList.tsx ===
+'use client'
+
+import { useState, useEffect } from 'react'
+import { NODE_TYPE_CONFIG, type NodeType, type BrainNode } from '@/lib/types'
+
+const TYPES: NodeType[] = ['entity', 'decision', 'risk', 'gap', 'dependency', 'flow', 'api', 'model']
+
+export default function BrainNodeList({ projectId }: { projectId: string }) {
+  const [nodes, setNodes] = useState<BrainNode[]>([])
+  const [filter, setFilter] = useState<NodeType | 'all'>('all')
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const url = filter === 'all'
+      ? `/api/v1/brain/${projectId}/nodes`
+      : `/api/v1/brain/${projectId}/nodes?node_type=${filter}`
+
+    fetch(url)
+      .then(r => r.json())
+      .then(data => { setNodes(data); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [projectId, filter])
+
+  const displayed = nodes.slice(0, 50)
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="label">Brain nodes</h3>
+        <span className="text-2xs text-muted">{nodes.length} total</span>
+      </div>
+
+      {/* Type filter */}
+      <div className="flex flex-wrap gap-1.5">
+        <button
+          onClick={() => setFilter('all')}
+          className={`badge cursor-pointer transition-colors ${
+            filter === 'all' ? 'bg-surface-3 text-foreground' : 'bg-surface-2 text-muted hover:text-foreground-2'
+          }`}
+        >
+          All
+        </button>
+        {TYPES.map(type => (
+          <button
+            key={type}
+            onClick={() => setFilter(type)}
+            className={`node-${type} cursor-pointer transition-opacity ${
+              filter === type ? 'opacity-100' : 'opacity-50 hover:opacity-75'
+            }`}
+          >
+            {NODE_TYPE_CONFIG[type].label}
+          </button>
+        ))}
+      </div>
+
+      {/* Nodes */}
+      {loading ? (
+        <div className="space-y-1.5">
+          {[...Array(5)].map((_, i) => (
+            <div key={i} className="card-2 h-14 animate-pulse" />
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {displayed.map(node => (
+            <NodeRow key={node.id} node={node} />
+          ))}
+          {nodes.length > 50 && (
+            <p className="text-center text-xs text-muted py-2">
+              Showing 50 of {nodes.length} nodes
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function NodeRow({ node }: { node: BrainNode }) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div
+      className="card-2 px-4 py-3 cursor-pointer hover:border-border-2 transition-colors"
+      onClick={() => setExpanded(e => !e)}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className={`node-${node.node_type} flex-shrink-0`}>
+            {NODE_TYPE_CONFIG[node.node_type]?.label || node.node_type}
+          </span>
+          <span className="text-sm text-foreground truncate">{node.label}</span>
+        </div>
+        {node.source_file && (
+          <span className="text-2xs text-muted font-mono flex-shrink-0 hidden sm:block">
+            {node.source_file.split('/').slice(-2).join('/')}
+          </span>
+        )}
+      </div>
+      {expanded && node.summary && (
+        <p className="text-xs text-foreground-2 mt-2 leading-relaxed">{node.summary}</p>
+      )}
+    </div>
+  )
+}
+
+=== apps/web/components/brain/BrainStatusPanel.tsx ===
+'use client'
+
+import { useEffect, useState } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { Brain, AlertTriangle, CheckCircle2, Loader2, XCircle } from 'lucide-react'
+import type { BrainSnapshot } from '@/lib/types'
+
+interface Props {
+  snapshot?: BrainSnapshot | null
+  projectId: string
+}
+
+const STATUS_CONFIG = {
+  complete: { icon: CheckCircle2, color: 'text-success', bg: 'bg-success/10', label: 'Brain active' },
+  building: { icon: Loader2,      color: 'text-accent',  bg: 'bg-accent/10',  label: 'Building Brain…' },
+  pending:  { icon: Loader2,      color: 'text-accent',  bg: 'bg-accent/10',  label: 'Starting build…' },
+  failed:   { icon: XCircle,      color: 'text-danger',  bg: 'bg-danger/10',  label: 'Build failed' },
+}
+
+export default function BrainStatusPanel({ snapshot: initialSnapshot, projectId }: Props) {
+  const [snapshot, setSnapshot] = useState(initialSnapshot)
+  const supabase = createClient()
+
+  // Realtime subscription — auto-updates when build completes
+  useEffect(() => {
+    const channel = supabase
+      .channel(`brain-${projectId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'brain_snapshots',
+          filter: `project_id=eq.${projectId}`,
+        },
+        (payload) => {
+          setSnapshot(payload.new as BrainSnapshot)
+        }
+      )
+      .subscribe()
+
+    return () => { supabase.removeChannel(channel) }
+  }, [projectId])
+
+  if (!snapshot) {
+    return (
+      <div className="card p-6 flex items-center gap-4">
+        <div className="w-10 h-10 rounded-lg bg-surface-2 border border-border flex items-center justify-center">
+          <Brain className="w-5 h-5 text-muted" />
+        </div>
+        <div>
+          <p className="text-sm text-foreground">No Brain built yet</p>
+          <p className="text-xs text-foreground-2 mt-0.5">
+            Trigger a build to start ingesting your codebase.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  const config = STATUS_CONFIG[snapshot.status as keyof typeof STATUS_CONFIG] || STATUS_CONFIG.pending
+  const StatusIcon = config.icon
+  const isActive = snapshot.status === 'building' || snapshot.status === 'pending'
+  const staleness = snapshot.staleness_score || 0
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className={`w-8 h-8 rounded-lg ${config.bg} flex items-center justify-center`}>
+            <StatusIcon className={`w-4 h-4 ${config.color} ${isActive ? 'animate-spin' : ''}`} />
+          </div>
+          <div>
+            <p className="text-sm font-medium text-foreground">{config.label}</p>
+            <p className="text-2xs text-foreground-2 mt-0.5">
+              v{snapshot.version}
+              {snapshot.built_at && ` · Built ${new Date(snapshot.built_at).toLocaleDateString()}`}
+            </p>
+          </div>
+        </div>
+
+        {snapshot.status === 'complete' && staleness > 0 && (
+          <div className="flex items-center gap-1.5">
+            <AlertTriangle className={`w-3.5 h-3.5 ${staleness >= 0.5 ? 'text-danger' : 'text-warning'}`} />
+            <span className={`text-xs ${staleness >= 0.5 ? 'text-danger' : 'text-warning'}`}>
+              {Math.round(staleness * 100)}% stale
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Build progress bar */}
+      {isActive && (
+        <div className="space-y-1.5">
+          <div className="h-0.5 bg-surface-3 rounded-full overflow-hidden">
+            <div className="h-full bg-accent rounded-full animate-brain-build" style={{ width: '60%' }} />
+          </div>
+          <div className="flex justify-between text-2xs text-muted">
+            <span>Ingesting codebase → extracting entities → synthesising graph</span>
+            <span>~2–5 min</span>
+          </div>
+        </div>
+      )}
+
+      {/* Error */}
+      {snapshot.status === 'failed' && snapshot.metadata?.error && (
+        <div className="bg-danger/5 border border-danger/20 rounded px-3 py-2">
+          <p className="text-2xs text-danger font-mono">{snapshot.metadata.error as string}</p>
+        </div>
+      )}
+
+      {/* Stats */}
+      {snapshot.status === 'complete' && snapshot.metadata?.total_nodes && (
+        <div className="flex items-center gap-4 pt-1 border-t border-border">
+          <span className="text-2xs text-foreground-2">
+            <span className="text-foreground font-medium">{snapshot.metadata.total_nodes}</span> nodes
+          </span>
+          {snapshot.metadata?.product_summary?.total_apis && (
+            <span className="text-2xs text-foreground-2">
+              <span className="text-foreground font-medium">{snapshot.metadata.product_summary.total_apis}</span> APIs
+            </span>
+          )}
+          {snapshot.metadata?.product_summary?.architecture_pattern && (
+            <span className="badge-muted">{snapshot.metadata.product_summary.architecture_pattern}</span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+=== apps/web/components/brain/BuildBrainButton.tsx ===
+'use client'
+
+import { useState } from 'react'
+import { Brain, Loader2, RefreshCw } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+
+interface Props {
+  projectId: string
+  isBuilding: boolean
+  hasExistingBrain: boolean
+}
+
+export default function BuildBrainButton({ projectId, isBuilding, hasExistingBrain }: Props) {
+  const [loading, setLoading] = useState(false)
+  const router = useRouter()
+
+  const handleBuild = async () => {
+    setLoading(true)
+    try {
+      await fetch(`/api/v1/brain/${projectId}/build`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trigger: 'manual', incremental: false }),
+      })
+      router.refresh()
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const busy = isBuilding || loading
+
+  return (
+    <button
+      onClick={handleBuild}
+      disabled={busy}
+      className="btn-primary"
+    >
+      {busy ? (
+        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+      ) : hasExistingBrain ? (
+        <RefreshCw className="w-3.5 h-3.5" />
+      ) : (
+        <Brain className="w-3.5 h-3.5" />
+      )}
+      {busy ? 'Building…' : hasExistingBrain ? 'Rebuild Brain' : 'Build Brain'}
+    </button>
+  )
+}
+
+=== apps/web/components/layout/Sidebar.tsx ===
+'use client'
+
+import Link from 'next/link'
+import { usePathname } from 'next/navigation'
+import { Brain, LayoutDashboard, FileText, Inbox, Search, Settings, LogOut, Key, GitGraph } from 'lucide-react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { cn } from '@/lib/utils'
+
+const NAV = [
+  { href: '/dashboard', label: 'Projects', icon: LayoutDashboard, exact: true },
+  { href: '/dashboard/query', label: 'Query Brain', icon: Search },
+  { href: '/dashboard/brain', label: 'Brain Map', icon: GitGraph },
+  { href: '/dashboard/prd', label: 'Generate PRD', icon: FileText },
+  { href: '/dashboard/intake', label: 'Intake', icon: Inbox },
+]
+
+export default function Sidebar({ user }: { user: any }) {
+  const pathname = usePathname()
+  const router = useRouter()
+  const supabase = createClient()
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut()
+    router.push('/auth/login')
+  }
+
+  return (
+    <aside className="w-52 flex-shrink-0 flex flex-col h-full bg-surface border-r border-border">
+      <div className="px-4 h-12 flex items-center gap-2 border-b border-border">
+        <div className="w-5 h-5 rounded bg-accent/20 border border-accent/30 flex items-center justify-center">
+          <Brain className="w-3 h-3 text-accent" />
+        </div>
+        <span className="font-display text-xs tracking-widest text-foreground uppercase">Cortex</span>
+      </div>
+
+      <nav className="flex-1 px-2 py-3 space-y-0.5">
+        {NAV.map(({ href, label, icon: Icon, exact }) => {
+          const active = exact ? pathname === href : pathname.startsWith(href)
+          return (
+            <Link key={href} href={href} className={cn(
+              'flex items-center gap-2.5 px-2.5 py-2 rounded text-sm transition-colors duration-100',
+              active ? 'bg-surface-3 text-foreground' : 'text-foreground-2 hover:text-foreground hover:bg-surface-2'
+            )}>
+              <Icon className={cn('w-3.5 h-3.5 flex-shrink-0', active ? 'text-accent' : '')} />
+              {label}
+            </Link>
+          )
+        })}
+      </nav>
+
+      <div className="px-2 py-3 border-t border-border space-y-0.5">
+        <Link href="/dashboard/settings" className={cn(
+          'flex items-center gap-2.5 px-2.5 py-2 rounded text-sm transition-colors',
+          pathname === '/dashboard/settings' ? 'bg-surface-3 text-foreground' : 'text-foreground-2 hover:text-foreground hover:bg-surface-2'
+        )}>
+          <Settings className="w-3.5 h-3.5" />
+          Settings
+        </Link>
+        <button onClick={handleSignOut} className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded text-sm text-foreground-2 hover:text-foreground hover:bg-surface-2 transition-colors">
+          <LogOut className="w-3.5 h-3.5" />
+          Sign out
+        </button>
+        <div className="mt-2 px-2.5 py-2 flex items-center gap-2">
+          <div className="w-5 h-5 rounded-full bg-accent/20 flex items-center justify-center flex-shrink-0">
+            <span className="text-2xs text-accent font-medium">{user?.email?.[0]?.toUpperCase()}</span>
+          </div>
+          <span className="text-2xs text-muted truncate">{user?.email}</span>
+        </div>
+      </div>
+    </aside>
+  )
+}
+

@@ -140,6 +140,9 @@ async def write_brain(graph: dict, project_id: str, snapshot_id: str) -> dict:
         from pipeline.community.detector import detect_communities
         communities = await detect_communities(project_id, snapshot_id, nodes)
         log.info("brain_writer.communities_done", count=len(communities))
+        if communities:
+            co_edges = await write_community_edges(communities, snapshot_id, project_id, db)
+            log.info("brain_writer.community_edges_done", count=co_edges)
     except Exception as e:
         log.warning("brain_writer.community_detection_failed", error=str(e)[:200])
 
