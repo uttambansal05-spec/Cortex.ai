@@ -15,6 +15,7 @@ INGEST_EXTENSIONS = {
     ".json", ".yaml", ".yml", ".toml",
     ".md", ".mdx", ".txt",
     ".html", ".css", ".scss", ".vue", ".svelte",
+    ".sql",
 }
 
 DEFAULT_IGNORE = [

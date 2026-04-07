@@ -17,9 +17,29 @@ CODE:
 {content}
 
 Return ONLY valid JSON with no markdown, no backticks, no explanation:
-{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary"}}
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does and HOW it works (include algorithm, logic, key implementation details)", "dependencies": []}}], "configs": [{{"label": "Name", "value": "The configured value", "detail": "Where and why this config is used"}}], "decisions": [{{"label": "Decision", "rationale": "Why"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary"}}
 
-Extract all meaningful entities, risks, gaps and decisions. Return valid JSON only."""
+Rules:
+- For ENTITIES: Include HOW it works, not just what. If a function uses keyword scoring, say so. If it hashes with SHA256, say so. Include the algorithm/approach.
+- For CONFIGS: Extract ALL model names (e.g. model="claude-haiku-4-5"), environment variables (e.g. settings.GITHUB_TOKEN), API endpoints, external service URLs, and hardcoded configuration values.
+- For functions: Describe the implementation logic in the summary, not just the purpose. "Scores nodes by keyword overlap" is better than "Gets relevant nodes".
+- Extract all meaningful entities, configs, risks, gaps and decisions. Return valid JSON only."""
+
+SQL_EXTRACT_PROMPT = """Analyse this SQL schema and extract structured knowledge.
+
+File: {file_path}
+
+SQL:
+{content}
+
+Return ONLY valid JSON with no markdown, no backticks, no explanation:
+{{"entities": [{{"label": "table_name", "type": "data_model", "summary": "What this table stores, its key columns and their types, and important constraints", "dependencies": []}}], "configs": [{{"label": "Name", "value": "Value", "detail": "Functions, triggers, indexes, or policies defined"}}], "decisions": [{{"label": "Decision", "rationale": "Why this schema choice was made"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Schema risks"}}], "gaps": [{{"label": "Gap", "detail": "What is missing from the schema"}}], "module_summary": "1-2 sentence summary of the database schema"}}
+
+Rules:
+- Extract EVERY table as a data_model entity. Include column names, types, foreign keys, and constraints in the summary.
+- Extract indexes, RLS policies, triggers, and functions as config entities.
+- Note foreign key relationships as dependencies between tables.
+- Return valid JSON only."""
 
 
 def _repair_json(text: str) -> dict:
@@ -47,7 +67,7 @@ def _repair_json(text: str) -> dict:
     
     # Try to extract just the arrays we need
     result = {}
-    for key in ["entities", "decisions", "risks", "gaps"]:
+    for key in ["entities", "decisions", "risks", "gaps", "configs"]:
         pattern = rf'"{key}"\s*:\s*(\[.*?\])'
         match = re.search(pattern, text, re.DOTALL)
         if match:
@@ -62,13 +82,16 @@ def _repair_json(text: str) -> dict:
     summary_match = re.search(r'"module_summary"\s*:\s*"([^"]*)"', text)
     result["module_summary"] = summary_match.group(1) if summary_match else ""
     
-    return result if any(result.get(k) for k in ["entities", "decisions", "risks", "gaps"]) else {}
+    return result if any(result.get(k) for k in ["entities", "decisions", "risks", "gaps", "configs"]) else {}
 
 
 async def extract_chunk(chunk: Chunk) -> dict:
-    prompt = EXTRACT_PROMPT.format(
+    # Use SQL-specific prompt for .sql files
+    is_sql = chunk.file_path.endswith('.sql')
+    template = SQL_EXTRACT_PROMPT if is_sql else EXTRACT_PROMPT
+    prompt = template.format(
         file_path=chunk.file_path,
-        language=chunk.language,
+        language=chunk.language if not is_sql else "sql",
         content=chunk.content[:4000],
     )
     try:

@@ -15,9 +15,13 @@ Here are the extracted entities, decisions, risks and gaps from {file_count} fil
 Synthesise these into a unified knowledge graph. Merge duplicates. You MUST create dependencies between entities. Every entity should link to at least one other entity, risk, or decision it is related to.
 
 Return ONLY valid JSON:
-{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "source_files": [], "dependencies": []}}], "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}], "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}], "product_summary": {{"what_it_does": "2-3 sentences", "core_modules": [], "tech_stack": [], "architecture_pattern": "monolith|microservices|serverless|hybrid"}}}}
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does and HOW it works", "source_files": [], "dependencies": []}}], "configs": [{{"label": "Name", "value": "Value", "detail": "Where and why", "source_files": []}}], "decisions": [{{"label": "Decision", "rationale": "Why", "source_files": []}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail", "source_files": []}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "dependencies": [{{"from_entity": "A", "to_entity": "B", "type": "imports|calls|extends|uses", "is_external": false}}], "user_flows": [{{"label": "Flow", "steps": [], "entities_involved": []}}], "product_summary": {{"what_it_does": "2-3 sentences", "core_modules": [], "tech_stack": [], "architecture_pattern": "monolith|microservices|serverless|hybrid"}}}}
 
-Return every entity, risk, gap and decision. Do not skip anything."""
+Rules:
+- Return every entity, risk, gap, config and decision. Do not skip anything.
+- For entities: include HOW it works in the summary, not just what it does.
+- For configs: preserve ALL model names, environment variables, API endpoints, and hardcoded values.
+- For data_model entities from SQL: preserve table names, column details, and constraints."""
 
 
 def _clean_json(text: str) -> dict:
@@ -39,16 +43,16 @@ def _clean_json(text: str) -> dict:
 
 def _empty_graph() -> dict:
     return {
-        "entities": [], "decisions": [], "risks": [], "gaps": [],
+        "entities": [], "decisions": [], "risks": [], "gaps": [], "configs": [],
         "dependencies": [], "user_flows": [],
         "product_summary": {"what_it_does": "", "core_modules": [], "tech_stack": [], "architecture_pattern": "unknown"}
     }
 
 
 def _merge(partials: list[dict]) -> dict:
-    merged = {"entities": [], "decisions": [], "risks": [], "gaps": [], "dependencies": [], "user_flows": [], "product_summary": {}}
+    merged = {"entities": [], "decisions": [], "risks": [], "gaps": [], "configs": [], "dependencies": [], "user_flows": [], "product_summary": {}}
     for p in partials:
-        for k in ["entities", "decisions", "risks", "gaps", "dependencies", "user_flows"]:
+        for k in ["entities", "decisions", "risks", "gaps", "configs", "dependencies", "user_flows"]:
             merged[k].extend(p.get(k, []) if isinstance(p.get(k), list) else [])
         if p.get("product_summary"):
             merged["product_summary"] = p["product_summary"]
@@ -73,6 +77,9 @@ def _flatten_extractions(extractions: list[dict]) -> list[dict]:
         for gap in e.get("gaps", []):
             gap["source_files"] = [file_path]
             flat.append({"type": "gap", **gap})
+        for config in e.get("configs", []):
+            config["source_files"] = [file_path]
+            flat.append({"type": "config", **config})
     return flat
 
 

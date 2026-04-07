@@ -16,6 +16,7 @@ NODE_TYPE_MAP = {
     "user_flows":   "flow",
     "apis":         "api",
     "data_models":  "model",
+    "configs":      "config",
 }
 
 EDGE_TYPE_MAP = {
