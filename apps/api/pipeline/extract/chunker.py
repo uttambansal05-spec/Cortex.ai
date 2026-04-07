@@ -87,8 +87,7 @@ def chunk_file(file: IngestedFile) -> list[Chunk]:
             # functions split at boundaries appearing "truncated"
             overlap = current_chunk[-OVERLAP_CHARS:] if len(current_chunk) > OVERLAP_CHARS else ""
             chunk_start_line = current_line
-            current_chunk = (overlap + "
-" + part) if overlap else part
+            current_chunk = (overlap + "\n" + part) if overlap else part
         else:
             current_chunk += ("\n" if current_chunk else "") + part
 
