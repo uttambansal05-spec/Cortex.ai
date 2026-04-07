@@ -98,7 +98,7 @@ async def extract_chunk(chunk: Chunk) -> dict:
         message = await asyncio.to_thread(
             _client.messages.create,
             model="claude-haiku-4-5",
-            max_tokens=1200,
+            max_tokens=2500,
             messages=[{"role": "user", "content": prompt}]
         )
         text = message.content[0].text.strip()
