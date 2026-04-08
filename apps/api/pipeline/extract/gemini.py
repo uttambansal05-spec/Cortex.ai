@@ -25,6 +25,22 @@ Rules:
 - Return as many entities as exist in the code. Do not summarize multiple entities into one.
 - Return valid JSON only."""
 
+SQL_EXTRACT_PROMPT = """Analyse this SQL schema and extract structured knowledge.
+
+File: {file_path}
+
+SQL:
+{content}
+
+Return ONLY valid JSON with no markdown, no backticks, no explanation:
+{{"entities": [{{"label": "table_name", "type": "data_model", "summary": "What this table stores, key columns and types, important constraints", "dependencies": []}}], "configs": [{{"label": "Name", "value": "Value", "detail": "Functions, triggers, indexes, or policies defined"}}], "decisions": [{{"label": "Decision", "rationale": "Why this schema choice was made"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Schema risks"}}], "gaps": [{{"label": "Gap", "detail": "What is missing from the schema"}}], "module_summary": "1-2 sentence summary of the database schema"}}
+
+Rules:
+- Extract EVERY table as a data_model entity. Include column names, types, foreign keys, and constraints in the summary.
+- Extract indexes, RLS policies, triggers, and functions as config entities.
+- Note foreign key relationships as dependencies between tables.
+- Return valid JSON only."""
+
 
 def _repair_json(text: str) -> dict:
     """Try multiple strategies to extract valid JSON."""
