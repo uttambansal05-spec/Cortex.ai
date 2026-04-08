@@ -138,9 +138,9 @@ class QueryAgent:
 
         scored = sorted(nodes, key=score, reverse=True)
 
-        # Always include risks and gaps at the top
-        priority = [n for n in scored if n["node_type"] in ("risk", "gap")]
-        rest = [n for n in scored if n["node_type"] not in ("risk", "gap")]
+        # Always include risks, gaps, and configs at the top
+        priority = [n for n in scored if n["node_type"] in ("risk", "gap", "config")]
+        rest = [n for n in scored if n["node_type"] not in ("risk", "gap", "config")]
 
         return (priority + rest)[:limit]
 

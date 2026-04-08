@@ -17,28 +17,12 @@ CODE:
 {content}
 
 Return ONLY valid JSON with no markdown, no backticks, no explanation:
-{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does and HOW it works (include algorithm, logic, key implementation details)", "dependencies": []}}], "configs": [{{"label": "Name", "value": "The configured value", "detail": "Where and why this config is used"}}], "decisions": [{{"label": "Decision", "rationale": "Why"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary"}}
+{{"entities": [{{"label": "Name", "type": "class|function|service|module|api_endpoint|data_model|config|util", "summary": "What it does", "dependencies": []}}], "configs": [{{"label": "Name", "value": "Exact value from code", "detail": "Where used"}}], "decisions": [{{"label": "Decision", "rationale": "Why"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary"}}
 
 Rules:
-- For ENTITIES: Include HOW it works, not just what. If a function uses keyword scoring, say so. If it hashes with SHA256, say so. Include the algorithm/approach.
-- For CONFIGS: Extract ALL model names (e.g. model="claude-haiku-4-5"), environment variables (e.g. settings.GITHUB_TOKEN), API endpoints, external service URLs, and hardcoded configuration values.
-- For functions: Describe the implementation logic in the summary, not just the purpose. "Scores nodes by keyword overlap" is better than "Gets relevant nodes".
-- Extract all meaningful entities, configs, risks, gaps and decisions. Return valid JSON only."""
-
-SQL_EXTRACT_PROMPT = """Analyse this SQL schema and extract structured knowledge.
-
-File: {file_path}
-
-SQL:
-{content}
-
-Return ONLY valid JSON with no markdown, no backticks, no explanation:
-{{"entities": [{{"label": "table_name", "type": "data_model", "summary": "What this table stores, its key columns and their types, and important constraints", "dependencies": []}}], "configs": [{{"label": "Name", "value": "Value", "detail": "Functions, triggers, indexes, or policies defined"}}], "decisions": [{{"label": "Decision", "rationale": "Why this schema choice was made"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Schema risks"}}], "gaps": [{{"label": "Gap", "detail": "What is missing from the schema"}}], "module_summary": "1-2 sentence summary of the database schema"}}
-
-Rules:
-- Extract EVERY table as a data_model entity. Include column names, types, foreign keys, and constraints in the summary.
-- Extract indexes, RLS policies, triggers, and functions as config entities.
-- Note foreign key relationships as dependencies between tables.
+- Extract ALL entities including functions, classes, endpoints, and modules.
+- For CONFIGS: Extract model names (e.g. model="claude-haiku-4-5"), environment variables, API URLs, and hardcoded values. These are critical.
+- Return as many entities as exist in the code. Do not summarize multiple entities into one.
 - Return valid JSON only."""
 
 
@@ -98,7 +82,7 @@ async def extract_chunk(chunk: Chunk) -> dict:
         message = await asyncio.to_thread(
             _client.messages.create,
             model="claude-haiku-4-5",
-            max_tokens=1800,
+            max_tokens=1200,
             messages=[{"role": "user", "content": prompt}]
         )
         text = message.content[0].text.strip()
