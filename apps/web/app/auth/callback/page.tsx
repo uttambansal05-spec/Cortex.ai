@@ -28,14 +28,14 @@ function CallbackHandler() {
 
 export default function AuthCallbackPage() {
   return (
-    <div className="flex items-center justify-center h-screen bg-background">
-      <div className="flex items-center gap-2">
-        <Brain className="w-4 h-4 text-accent animate-pulse" />
-        <span className="text-sm text-foreground-2">Signing you in...</span>
+    <div className="flex items-center justify-center h-screen bg-bg-0">
+      <div className="flex flex-col items-center gap-3">
+        <div className="w-10 h-10 rounded-xl bg-accent-muted border border-accent-border flex items-center justify-center">
+          <Brain className="w-4 h-4 text-accent animate-pulse" />
+        </div>
+        <span className="text-xs text-text-2 font-display">Signing you in...</span>
       </div>
-      <Suspense>
-        <CallbackHandler />
-      </Suspense>
+      <Suspense><CallbackHandler /></Suspense>
     </div>
   )
 }

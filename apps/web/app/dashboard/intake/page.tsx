@@ -1,23 +1,18 @@
 'use client'
 
-import { Inbox, Brain } from 'lucide-react'
+import { Inbox, ArrowRight } from 'lucide-react'
 
 export default function IntakePage() {
   return (
-    <div className="p-8 max-w-3xl mx-auto">
-      <div className="flex items-center gap-3 mb-8">
-        <Inbox className="w-4 h-4 text-accent" />
-        <h1 className="text-base font-medium text-foreground">Intake</h1>
+    <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in">
+      <div className="w-14 h-14 rounded-2xl bg-bg-2 border border-border flex items-center justify-center mb-5">
+        <Inbox className="w-6 h-6 text-text-2" />
       </div>
-      <div className="flex flex-col items-center justify-center py-24 text-center">
-        <div className="w-12 h-12 rounded-lg bg-surface-2 border border-border flex items-center justify-center mb-4">
-          <Brain className="w-5 h-5 text-muted" />
-        </div>
-        <h3 className="text-sm font-medium text-foreground mb-1">Coming soon</h3>
-        <p className="text-xs text-foreground-2 max-w-xs">
-          Submit feature requests. Brain cross-checks against the codebase — flags duplicates, surfaces feasibility, auto-routes to the right team.
-        </p>
-      </div>
+      <h3 className="text-base font-display font-medium text-text-0 mb-1.5">Intake</h3>
+      <p className="text-xs text-text-2 max-w-xs leading-relaxed mb-6">
+        Submit feature requests. Brain cross-checks against the codebase \u2014 flags duplicates, surfaces feasibility.
+      </p>
+      <span className="badge-accent"><ArrowRight className="w-3 h-3" /> Coming soon</span>
     </div>
   )
 }

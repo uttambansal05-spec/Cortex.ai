@@ -21,13 +21,18 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   }, [])
 
   if (loading) return (
-    <div className="flex items-center justify-center h-screen bg-background">
-      <Brain className="w-4 h-4 text-accent animate-pulse" />
+    <div className="flex items-center justify-center h-screen bg-bg-0">
+      <div className="flex flex-col items-center gap-3">
+        <div className="w-10 h-10 rounded-xl bg-accent-muted border border-accent-border flex items-center justify-center">
+          <Brain className="w-4 h-4 text-accent animate-pulse" />
+        </div>
+        <span className="text-xs text-text-2 font-display">Loading Cortex...</span>
+      </div>
     </div>
   )
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background">
+    <div className="flex h-screen overflow-hidden bg-bg-0">
       <Sidebar user={user} />
       <main className="flex-1 overflow-y-auto">
         {children}

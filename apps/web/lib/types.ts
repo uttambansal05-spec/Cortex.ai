@@ -1,4 +1,4 @@
-export type NodeType = 'entity' | 'decision' | 'risk' | 'gap' | 'dependency' | 'flow' | 'api' | 'model'
+export type NodeType = 'entity' | 'decision' | 'risk' | 'gap' | 'dependency' | 'flow' | 'api' | 'model' | 'config'
 
 export type BrainStatus = 'pending' | 'building' | 'complete' | 'failed'
 
@@ -29,12 +29,13 @@ export interface BrainNode {
 }
 
 export const NODE_TYPE_CONFIG: Record<NodeType, { label: string; color: string }> = {
-  entity:     { label: 'Entity',      color: '#6366F1' },
-  decision:   { label: 'Decision',    color: '#8B5CF6' },
-  risk:       { label: 'Risk',        color: '#EF4444' },
-  gap:        { label: 'Gap',         color: '#F59E0B' },
-  dependency: { label: 'Dependency',  color: '#06B6D4' },
-  flow:       { label: 'Flow',        color: '#22C55E' },
-  api:        { label: 'API',         color: '#EC4899' },
-  model:      { label: 'Model',       color: '#F97316' },
+  entity:     { label: 'Entity',      color: '#818CF8' },
+  decision:   { label: 'Decision',    color: '#34D399' },
+  risk:       { label: 'Risk',        color: '#F87171' },
+  gap:        { label: 'Gap',         color: '#FBBF24' },
+  dependency: { label: 'Dependency',  color: '#64748B' },
+  flow:       { label: 'Flow',        color: '#22D3EE' },
+  api:        { label: 'API',         color: '#F472B6' },
+  model:      { label: 'Model',       color: '#60A5FA' },
+  config:     { label: 'Config',      color: '#A78BFA' },
 }

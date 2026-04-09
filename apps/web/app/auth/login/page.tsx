@@ -33,46 +33,37 @@ export default function LoginPage() {
 
   return (
     <div className="animate-slide-up">
-      <div className="flex items-center gap-2 mb-10">
-        <div className="w-7 h-7 rounded bg-accent/20 border border-accent/30 flex items-center justify-center">
-          <Brain className="w-4 h-4 text-accent" />
+      <div className="flex items-center gap-2.5 mb-9">
+        <div className="w-8 h-8 rounded-lg bg-accent-muted border border-accent-border flex items-center justify-center shadow-[0_0_20px_rgba(16,185,129,0.12)]">
+          <Brain className="w-4.5 h-4.5 text-accent" />
         </div>
-        <span className="font-display text-sm tracking-widest text-foreground uppercase">Cortex</span>
+        <span className="font-display text-[15px] font-semibold tracking-[0.1em] text-text-0 uppercase">Cortex</span>
       </div>
 
-      <div className="card p-6 space-y-5">
-        <div>
-          <h1 className="text-sm font-medium text-foreground mb-1">
-            {isSignUp ? 'Create your account' : 'Sign in to Cortex'}
+      <div className="bg-bg-2/90 backdrop-blur-xl border border-border rounded-2xl p-7">
+        <div className="mb-6">
+          <h1 className="text-lg font-display font-semibold text-text-0 mb-1">
+            {isSignUp ? 'Create your account' : 'Welcome back'}
           </h1>
-          <p className="text-xs text-foreground-2">Early access only.</p>
+          <p className="text-[13px] text-text-2">
+            {isSignUp ? 'Start building your Product Brain' : 'Sign in to your Product Brain'}
+          </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-3">
-          <input
-            type="email"
-            placeholder="you@company.com"
-            value={email}
-            onChange={e => setEmail(e.target.value)}
-            className="input"
-            required
-            autoFocus
-          />
-          <input
-            type="password"
-            placeholder="Password"
-            value={password}
-            onChange={e => setPassword(e.target.value)}
-            className="input"
-            required
-            minLength={6}
-          />
+        <form onSubmit={handleSubmit} className="space-y-3.5">
+          <div>
+            <label className="label block mb-1.5">Email</label>
+            <input type="email" placeholder="you@company.com" value={email}
+              onChange={e => setEmail(e.target.value)} className="input" required autoFocus />
+          </div>
+          <div>
+            <label className="label block mb-1.5">Password</label>
+            <input type="password" placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" value={password}
+              onChange={e => setPassword(e.target.value)} className="input" required minLength={6} />
+          </div>
           {error && <p className="text-xs text-danger">{error}</p>}
-          <button
-            type="submit"
-            disabled={loading || !email || !password}
-            className="btn-primary w-full justify-center"
-          >
+          <button type="submit" disabled={loading || !email || !password}
+            className="btn-primary w-full justify-center mt-1">
             {loading ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
@@ -84,13 +75,16 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <button
-          onClick={() => { setIsSignUp(!isSignUp); setError('') }}
-          className="text-xs text-accent hover:text-accent-2 transition-colors w-full text-center"
-        >
+        <button onClick={() => { setIsSignUp(!isSignUp); setError('') }}
+          className="text-xs text-accent hover:text-accent-hover transition-colors w-full text-center mt-5">
           {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
         </button>
       </div>
+
+      <p className="text-[11px] text-text-3 text-center mt-7 leading-relaxed">
+        Your product's living brain.<br />
+        <span className="text-text-2">One API for every AI tool.</span>
+      </p>
     </div>
   )
 }
