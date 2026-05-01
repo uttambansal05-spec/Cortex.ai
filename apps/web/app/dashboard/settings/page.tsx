@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState, useRef } from 'react'
-import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
+import { createClient } from '@/lib/supabase/client'
 import { 
   Key, Plus, Trash2, Copy, CheckCircle2, ChevronDown, ChevronRight,
   Loader2, AlertTriangle, Terminal, Code2, Braces, BookOpen
@@ -85,7 +85,7 @@ function getUsageHint(tab: TabId): string {
 }
 
 export default function SettingsPage() {
-  const supabase = createClientComponentClient()
+  const supabase = createClient()
   const [session, setSession] = useState<any>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [selectedProject, setSelectedProject] = useState<string>('')
