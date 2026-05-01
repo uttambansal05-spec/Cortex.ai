@@ -104,20 +104,29 @@ export default function SettingsPage() {
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session)
-      if (data.session) loadProjects(data.session.access_token)
+      if (data.session) loadProjects()
     })
   }, [])
 
-  const loadProjects = async (token: string) => {
-    const res = await fetch('/api/projects', {
-      headers: { 'Authorization': `Bearer ${token}` },
-    })
-    const data = await res.json()
-    if (data.length > 0) {
-      setProjects(data)
-      setSelectedProject(data[0].id)
-      setSelectedProjectName(data[0].name)
-      loadKeys(data[0].id, token)
+  const loadProjects = async () => {
+    const { data: { session: s } } = await supabase.auth.getSession()
+    if (!s) return
+    const { data: workspace } = await supabase
+      .from('workspaces')
+      .select('id')
+      .eq('owner_id', s.user.id)
+      .single()
+    if (!workspace) return
+    const { data: projectData } = await supabase
+      .from('projects')
+      .select('id, name')
+      .eq('workspace_id', workspace.id)
+      .order('created_at', { ascending: false })
+    if (projectData && projectData.length > 0) {
+      setProjects(projectData)
+      setSelectedProject(projectData[0].id)
+      setSelectedProjectName(projectData[0].name)
+      loadKeys(projectData[0].id, s.access_token)
     }
   }
 
