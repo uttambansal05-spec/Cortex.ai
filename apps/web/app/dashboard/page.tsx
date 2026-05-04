@@ -12,6 +12,8 @@ export default function DashboardPage() {
   const router = useRouter()
   const supabase = createClient()
 
+  useEffect(() => { document.title = 'Projects · Cortex' }, [])
+
   useEffect(() => {
     const load = async () => {
       const { data: { session } } = await supabase.auth.getSession()

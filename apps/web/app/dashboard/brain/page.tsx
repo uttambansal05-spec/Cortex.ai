@@ -55,6 +55,8 @@ export default function BrainMapPage() {
   const searchParams = useSearchParams()
   const supabase = createClient()
 
+  useEffect(() => { document.title = 'Brain Map · Cortex' }, [])
+
   useEffect(() => {
     const load = async () => {
       const { data: { session } } = await supabase.auth.getSession()

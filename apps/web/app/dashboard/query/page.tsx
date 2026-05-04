@@ -38,6 +38,8 @@ export default function QueryPage() {
   const searchParams = useSearchParams()
   const supabase = createClient()
 
+  useEffect(() => { document.title = 'Query Brain · Cortex' }, [])
+
   useEffect(() => {
     const load = async () => {
       const { data: { session } } = await supabase.auth.getSession()

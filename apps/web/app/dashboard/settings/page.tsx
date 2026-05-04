@@ -101,6 +101,8 @@ export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState<TabId>('claude')
   const [instructionCopied, setInstructionCopied] = useState(false)
 
+  useEffect(() => { document.title = 'Settings · Cortex' }, [])
+
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session)
