@@ -2,7 +2,6 @@ from fastapi import APIRouter, HTTPException, Header, BackgroundTasks, UploadFil
 from models.schemas import BrainBuildRequest, BrainSnapshot, BrainStats, BrainStatus
 from core.database import get_supabase
 from workers.build_brain import build_brain_task
-from workers.ingest_doc import ingest_doc_task
 import structlog
 import uuid
 import base64
@@ -197,7 +196,7 @@ async def ingest_document(
         db.table("brain_snapshots")
         .select("id")
         .eq("project_id", project_id)
-        .eq("status", BrainStatus.COMPLETE)
+        .eq("status", "complete")
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -212,6 +211,8 @@ async def ingest_document(
 
     file_b64 = base64.b64encode(file_bytes).decode("ascii")
 
+    # Lazy import to avoid Celery initialization on web process
+    from workers.ingest_doc import ingest_doc_task
     ingest_doc_task.delay(
         project_id=project_id,
         snapshot_id=snapshot_id,
