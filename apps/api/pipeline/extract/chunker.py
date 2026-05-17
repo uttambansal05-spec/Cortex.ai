@@ -1,115 +1,68 @@
-import re
+import tiktoken
 from dataclasses import dataclass
-from pipeline.ingest.github import IngestedFile
+from pipeline.ingest.models import IngestedFile
+import structlog
 
-MAX_CHUNK_TOKENS = 6000   # safe for Gemini Flash context
-CHARS_PER_TOKEN  = 4      # rough estimate
-OVERLAP_CHARS    = 500    # overlap between chunks to prevent false truncation
+log = structlog.get_logger()
+_enc = tiktoken.get_encoding("cl100k_base")
+
+MAX_CHUNK_TOKENS = 6000
+OVERLAP_CHARS = 500
 
 
 @dataclass
 class Chunk:
-    chunk_id: str
     file_path: str
     language: str
     content: str
-    chunk_index: int
-    total_chunks: int
-    start_line: int
-    end_line: int
-    tokens_estimate: int
+    chunk_id: str
+    token_count: int
 
 
-def _estimate_tokens(text: str) -> int:
-    return len(text) // CHARS_PER_TOKEN
+def _count_tokens(text: str) -> int:
+    return len(_enc.encode(text, disallowed_special=()))
 
 
-def _split_by_semantic_boundary(content: str, language: str) -> list[str]:
-    """Split code at function/class boundaries where possible."""
-    if language in ("python",):
-        # Split on top-level def/class
-        pattern = r'\n(?=(?:def |class |async def ))'
-    elif language in ("javascript", "typescript"):
-        # Split on function declarations and class definitions
-        pattern = r'\n(?=(?:function |class |const \w+ = |export ))'
-    elif language in ("java", "kotlin", "csharp"):
-        pattern = r'\n(?=(?:public |private |protected |class |interface ))'
-    else:
-        pattern = r'\n\n+'  # Split on blank lines for others
+def _split_text(text: str, max_tokens: int, overlap: int) -> list[str]:
+    """Split text into overlapping chunks by token count."""
+    if _count_tokens(text) <= max_tokens:
+        return [text]
 
-    parts = re.split(pattern, content)
-    return [p for p in parts if p.strip()]
+    chunks = []
+    start = 0
+    while start < len(text):
+        # Binary search for the right end position
+        end = min(start + max_tokens * 4, len(text))  # rough char estimate
+        snippet = text[start:end]
+
+        # Trim down to max_tokens
+        while _count_tokens(snippet) > max_tokens and len(snippet) > 100:
+            snippet = snippet[:int(len(snippet) * 0.9)]
+
+        chunks.append(snippet)
+        # Move start forward, minus overlap
+        start += max(len(snippet) - overlap, 100)
+
+    return chunks
 
 
 def chunk_file(file: IngestedFile) -> list[Chunk]:
-    """Split a file into context-window-safe chunks."""
-    content = file.content
-    total_tokens = _estimate_tokens(content)
+    """Split an ingested file into token-bounded chunks."""
+    if not file.content or not file.content.strip():
+        return []
 
-    # If small enough, return as single chunk
-    if total_tokens <= MAX_CHUNK_TOKENS:
-        return [Chunk(
-            chunk_id=f"{file.path}::0",
-            file_path=file.path,
-            language=file.language,
-            content=content,
-            chunk_index=0,
-            total_chunks=1,
-            start_line=1,
-            end_line=content.count('\n') + 1,
-            tokens_estimate=total_tokens,
-        )]
-
-    # Split semantically first, then by size
-    semantic_parts = _split_by_semantic_boundary(content, file.language)
-    chunks: list[Chunk] = []
-    current_chunk = ""
-    current_line = 1
-    chunk_start_line = 1
-
-    for part in semantic_parts:
-        part_tokens = _estimate_tokens(part)
-
-        if _estimate_tokens(current_chunk + part) > MAX_CHUNK_TOKENS and current_chunk:
-            # Flush current chunk
-            chunks.append(Chunk(
-                chunk_id=f"{file.path}::{len(chunks)}",
-                file_path=file.path,
-                language=file.language,
-                content=current_chunk,
-                chunk_index=len(chunks),
-                total_chunks=0,  # filled after
-                start_line=chunk_start_line,
-                end_line=current_line,
-                tokens_estimate=_estimate_tokens(current_chunk),
-            ))
-            # Carry overlap from end of previous chunk to prevent
-            # functions split at boundaries appearing "truncated"
-            overlap = current_chunk[-OVERLAP_CHARS:] if len(current_chunk) > OVERLAP_CHARS else ""
-            chunk_start_line = current_line
-            current_chunk = (overlap + "\n" + part) if overlap else part
-        else:
-            current_chunk += ("\n" if current_chunk else "") + part
-
-        current_line += part.count('\n') + 1
-
-    # Flush remaining
-    if current_chunk:
+    parts = _split_text(file.content, MAX_CHUNK_TOKENS, OVERLAP_CHARS)
+    chunks = []
+    for i, part in enumerate(parts):
+        tc = _count_tokens(part)
         chunks.append(Chunk(
-            chunk_id=f"{file.path}::{len(chunks)}",
             file_path=file.path,
             language=file.language,
-            content=current_chunk,
-            chunk_index=len(chunks),
-            total_chunks=0,
-            start_line=chunk_start_line,
-            end_line=current_line,
-            tokens_estimate=_estimate_tokens(current_chunk),
+            content=part,
+            chunk_id=f"{file.path}::chunk_{i}",
+            token_count=tc,
         ))
 
-    # Fill total_chunks
-    total = len(chunks)
-    for chunk in chunks:
-        chunk.total_chunks = total
-
+    log.debug("chunker.split", file=file.path, chunks=len(chunks),
+              total_tokens=sum(c.token_count for c in chunks))
     return chunks

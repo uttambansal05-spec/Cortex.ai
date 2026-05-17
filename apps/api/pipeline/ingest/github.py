@@ -1,10 +1,10 @@
 import os
 import base64
 import fnmatch
-from dataclasses import dataclass
 from typing import Iterator
 from github import Github, GithubException
 from core.config import settings
+from pipeline.ingest.models import IngestedFile
 import structlog
 
 log = structlog.get_logger()
@@ -29,16 +29,6 @@ DEFAULT_IGNORE = [
 
 MAX_FILE_SIZE_BYTES = 100 * 1024  # 100KB hard cap
 MAX_FILES = 300
-
-
-@dataclass
-class IngestedFile:
-    path: str
-    content: str
-    language: str
-    size_bytes: int
-    last_modified: str
-    pr_blame: str | None = None
 
 
 def get_language(path: str) -> str:
@@ -135,6 +125,7 @@ def ingest_github_repo(
                     language=get_language(full_path),
                     size_bytes=len(content_bytes),
                     last_modified="",
+                    source_type="github",
                 )
                 file_count += 1
 

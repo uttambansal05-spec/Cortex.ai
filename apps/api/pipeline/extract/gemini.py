@@ -41,6 +41,27 @@ Rules:
 - Note foreign key relationships as dependencies between tables.
 - Return valid JSON only."""
 
+DOC_EXTRACT_PROMPT = """Analyse this product document and extract structured knowledge.
+
+File: {file_path}
+
+DOCUMENT:
+{content}
+
+Return ONLY valid JSON with no markdown, no backticks, no explanation:
+{{"entities": [{{"label": "Name", "type": "requirement|user_story|metric|persona|decision_log|process", "summary": "What it describes", "dependencies": []}}], "configs": [{{"label": "Name", "value": "Value", "detail": "Where referenced"}}], "decisions": [{{"label": "Decision", "rationale": "Why this was decided"}}], "risks": [{{"label": "Risk", "severity": "high|medium|low", "detail": "Detail"}}], "gaps": [{{"label": "Gap", "detail": "What is missing"}}], "module_summary": "1-2 sentence summary of the document"}}
+
+Rules:
+- Extract product requirements as type "requirement" with clear acceptance criteria in the summary.
+- Extract user stories as type "user_story" in "As a [role], I want [goal] so that [benefit]" format.
+- Extract success metrics, KPIs, and targets as type "metric" with specific numbers when available.
+- Extract user personas or audience segments as type "persona".
+- Extract decisions with rationale and alternatives considered as type "decision_log".
+- Extract workflows, SOPs, and processes as type "process" with step descriptions.
+- In dependencies, reference any code entities, services, or APIs mentioned in the doc by name.
+- Return as many entities as exist. Do not skip or merge distinct items.
+- Return valid JSON only."""
+
 
 def _repair_json(text: str) -> dict:
     """Try multiple strategies to extract valid JSON."""
@@ -86,9 +107,17 @@ def _repair_json(text: str) -> dict:
 
 
 async def extract_chunk(chunk: Chunk) -> dict:
-    # Use SQL-specific prompt for .sql files
+    # Route to the right prompt based on file type
     is_sql = chunk.file_path.endswith('.sql')
-    template = SQL_EXTRACT_PROMPT if is_sql else EXTRACT_PROMPT
+    is_doc = chunk.file_path.startswith('upload://') or chunk.file_path.startswith('notion://')
+    
+    if is_sql:
+        template = SQL_EXTRACT_PROMPT
+    elif is_doc:
+        template = DOC_EXTRACT_PROMPT
+    else:
+        template = EXTRACT_PROMPT
+    
     prompt = template.format(
         file_path=chunk.file_path,
         language=chunk.language if not is_sql else "sql",

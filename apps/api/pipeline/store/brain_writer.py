@@ -17,6 +17,13 @@ NODE_TYPE_MAP = {
     "apis":         "api",
     "data_models":  "model",
     "configs":      "config",
+    # Product/doc node types (extraction writes these as entities with subtype)
+    "requirements":   "requirement",
+    "user_stories":   "user_story",
+    "metrics":        "metric",
+    "personas":       "persona",
+    "decision_logs":  "decision_log",
+    "processes":      "process",
 }
 
 EDGE_TYPE_MAP = {
@@ -30,6 +37,12 @@ def _fingerprint(node_type: str, label: str, project_id: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+# Product entity subtypes - when extraction writes entities with product types
+PRODUCT_ENTITY_TYPES = {
+    "requirement", "user_story", "metric", "persona", "decision_log", "process",
+}
+
+
 def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]:
     rows = []
     seen = set()
@@ -40,21 +53,42 @@ def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]
             label = item.get("label") or item.get("from_entity") or ""
             if not label:
                 continue
-            fp = _fingerprint(node_type, str(label), project_id)
+
+            # For entities, check if the item's "type" field is a product subtype
+            resolved_type = node_type
+            if graph_key == "entities":
+                item_type = item.get("type", "")
+                if item_type in PRODUCT_ENTITY_TYPES:
+                    resolved_type = item_type
+
+            fp = _fingerprint(resolved_type, str(label), project_id)
             if fp in seen:
                 continue
             seen.add(fp)
             summary = (
                 item.get("summary") or item.get("detail") or item.get("rationale") or
-                f"{item.get('from_entity', '')} → {item.get('to_entity', '')}"
+                f"{item.get('from_entity', '')} -> {item.get('to_entity', '')}"
             )
             source_files = item.get("source_files") or []
             source_file = source_files[0] if source_files else item.get("source_file")
+
+            # Determine source_type and domain from file path
+            sf = source_file or ""
+            if sf.startswith("upload://"):
+                src_type = "upload"
+                domain = "product"
+            elif sf.startswith("notion://"):
+                src_type = "notion"
+                domain = "product"
+            else:
+                src_type = "github"
+                domain = "code"
+
             rows.append({
                 "id": str(uuid.uuid4()),
                 "snapshot_id": snapshot_id,
                 "project_id": project_id,
-                "node_type": node_type,
+                "node_type": resolved_type,
                 "label": str(label)[:500],
                 "summary": str(summary or "")[:2000],
                 "metadata": {k: v for k, v in item.items()
@@ -62,8 +96,8 @@ def _extract_nodes(graph: dict, project_id: str, snapshot_id: str) -> list[dict]
                 "source_file": source_file,
                 "source_pr": None,
                 "fingerprint": fp,
-                "domain": "code",
-                "source_type": "github",
+                "domain": domain,
+                "source_type": src_type,
             })
     return rows
 
@@ -203,3 +237,123 @@ async def write_community_edges(communities: list[dict], snapshot_id: str, proje
             except Exception:
                 pass
     return len(rows)
+
+
+async def get_existing_nodes(project_id: str, snapshot_id: str,
+                             domain: str | None = None) -> tuple[list[dict], dict]:
+    """Fetch existing brain nodes for a snapshot.
+
+    Returns:
+        (nodes_list, label_to_id_map)
+    """
+    db = get_supabase()
+    query = (
+        db.table("brain_nodes")
+        .select("id, node_type, label, summary, domain, source_type")
+        .eq("snapshot_id", snapshot_id)
+        .eq("project_id", project_id)
+    )
+    if domain:
+        query = query.eq("domain", domain)
+
+    result = query.execute()
+    nodes = result.data or []
+
+    label_to_id = {}
+    for n in nodes:
+        label_to_id[n["label"].lower().strip()] = n["id"]
+
+    return nodes, label_to_id
+
+
+async def write_doc_nodes(graph: dict, project_id: str, snapshot_id: str) -> dict:
+    """Write doc-sourced nodes and edges to an existing snapshot.
+
+    Unlike write_brain() which creates a new snapshot, this appends
+    to an existing one. Used for document ingestion on top of a
+    code Brain.
+
+    Returns dict with node/edge counts and the new label_to_id mapping.
+    """
+    db = get_supabase()
+
+    nodes = _extract_nodes(graph, project_id, snapshot_id)
+    log.info("brain_writer.writing_doc_nodes", count=len(nodes))
+
+    if not nodes:
+        return {"doc_nodes": 0, "doc_edges": 0, "label_to_id": {}}
+
+    label_to_id = {}
+    batch_size = 50
+    for i in range(0, len(nodes), batch_size):
+        batch = nodes[i:i + batch_size]
+        try:
+            db.table("brain_nodes").insert(batch).execute()
+        except Exception as e:
+            # Handle fingerprint conflicts (node already exists from prior ingest)
+            log.warning("brain_writer.doc_node_conflict", error=str(e)[:100])
+            # Insert one by one to skip conflicts
+            for node in batch:
+                try:
+                    db.table("brain_nodes").insert(node).execute()
+                except Exception:
+                    pass
+        for n in batch:
+            label_to_id[n["label"].lower().strip()] = n["id"]
+
+    # Also include existing nodes in label_to_id for edge resolution
+    existing_nodes, existing_map = await get_existing_nodes(project_id, snapshot_id)
+    full_label_to_id = {**existing_map, **label_to_id}
+
+    edges = _extract_edges(graph, full_label_to_id, snapshot_id, project_id)
+    if edges:
+        for i in range(0, len(edges), batch_size):
+            try:
+                db.table("brain_edges").insert(edges[i:i + batch_size]).execute()
+            except Exception as e:
+                log.warning("brain_writer.doc_edge_failed", error=str(e)[:100])
+
+    # Update snapshot metadata to reflect doc additions
+    try:
+        snap = db.table("brain_snapshots").select("metadata").eq("id", snapshot_id).single().execute()
+        meta = snap.data.get("metadata", {}) if snap.data else {}
+        meta["doc_nodes"] = meta.get("doc_nodes", 0) + len(nodes)
+        meta["doc_edges"] = meta.get("doc_edges", 0) + len(edges)
+        meta["total_nodes"] = meta.get("total_nodes", 0) + len(nodes)
+        meta["total_edges"] = meta.get("total_edges", 0) + len(edges)
+        db.table("brain_snapshots").update({"metadata": meta}).eq("id", snapshot_id).execute()
+    except Exception as e:
+        log.warning("brain_writer.metadata_update_failed", error=str(e)[:100])
+
+    log.info("brain_writer.doc_write_complete", nodes=len(nodes), edges=len(edges))
+    return {
+        "doc_nodes": len(nodes),
+        "doc_edges": len(edges),
+        "label_to_id": label_to_id,
+    }
+
+
+async def write_cross_edges(edges: list[dict]) -> int:
+    """Write cross-source linker edges to brain_edges table.
+
+    Args:
+        edges: pre-built edge dicts from linker.link_cross_source()
+
+    Returns:
+        Number of edges written.
+    """
+    if not edges:
+        return 0
+
+    db = get_supabase()
+    batch_size = 50
+    written = 0
+    for i in range(0, len(edges), batch_size):
+        try:
+            db.table("brain_edges").insert(edges[i:i + batch_size]).execute()
+            written += len(edges[i:i + batch_size])
+        except Exception as e:
+            log.warning("brain_writer.cross_edge_failed", error=str(e)[:100])
+
+    log.info("brain_writer.cross_edges_written", count=written)
+    return written

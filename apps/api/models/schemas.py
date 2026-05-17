@@ -5,7 +5,7 @@ from enum import Enum
 import uuid
 
 
-# ─── Enums ────────────────────────────────────────────────────────────────────
+# --- Enums ---
 
 class BrainStatus(str, Enum):
     PENDING  = "pending"
@@ -19,14 +19,21 @@ class BuildTrigger(str, Enum):
     SCHEDULED = "scheduled"
 
 class NodeType(str, Enum):
-    ENTITY     = "entity"
-    DECISION   = "decision"
-    RISK       = "risk"
-    GAP        = "gap"
-    DEPENDENCY = "dependency"
-    FLOW       = "flow"
-    API        = "api"
-    MODEL      = "model"
+    ENTITY       = "entity"
+    DECISION     = "decision"
+    RISK         = "risk"
+    GAP          = "gap"
+    DEPENDENCY   = "dependency"
+    FLOW         = "flow"
+    API          = "api"
+    MODEL        = "model"
+    CONFIG       = "config"
+    REQUIREMENT  = "requirement"
+    USER_STORY   = "user_story"
+    METRIC       = "metric"
+    PERSONA      = "persona"
+    DECISION_LOG = "decision_log"
+    PROCESS      = "process"
 
 class IntakeStatus(str, Enum):
     PENDING   = "pending"
@@ -36,7 +43,7 @@ class IntakeStatus(str, Enum):
     DUPLICATE = "duplicate"
 
 
-# ─── Project ──────────────────────────────────────────────────────────────────
+# --- Project ---
 
 class ProjectConfig(BaseModel):
     ingest_scope: list[str] = ["code", "prs"]
@@ -67,7 +74,7 @@ class Project(BaseModel):
         from_attributes = True
 
 
-# ─── Brain ────────────────────────────────────────────────────────────────────
+# --- Brain ---
 
 class BrainBuildRequest(BaseModel):
     trigger: BuildTrigger = BuildTrigger.MANUAL
@@ -111,7 +118,7 @@ class BrainStats(BaseModel):
     prs_processed: int
 
 
-# ─── Agents ───────────────────────────────────────────────────────────────────
+# --- Agents ---
 
 class QueryRequest(BaseModel):
     project_id: uuid.UUID
@@ -134,7 +141,7 @@ class PRDStep1Response(BaseModel):
 
 class PRDStep2(BaseModel):
     session_id: str
-    answers: dict[str, str]           # question_id → answer
+    answers: dict[str, str]           # question_id -> answer
 
 class PRDResponse(BaseModel):
     id: uuid.UUID
@@ -157,7 +164,7 @@ class IntakeResponse(BaseModel):
     created_at: datetime
 
 
-# ─── Webhooks ─────────────────────────────────────────────────────────────────
+# --- Webhooks ---
 
 class GitHubWebhookPayload(BaseModel):
     action: Optional[str] = None

@@ -1,12 +1,17 @@
-from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Header, BackgroundTasks, UploadFile, File
 from models.schemas import BrainBuildRequest, BrainSnapshot, BrainStats, BrainStatus
 from core.database import get_supabase
 from workers.build_brain import build_brain_task
+from workers.ingest_doc import ingest_doc_task
 import structlog
 import uuid
+import base64
 
 router = APIRouter()
 log = structlog.get_logger()
+
+ALLOWED_DOC_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
+MAX_UPLOAD_SIZE = 2 * 1024 * 1024  # 2MB
 
 
 @router.post("/{project_id}/build", status_code=202)
@@ -16,7 +21,7 @@ async def trigger_build(
     background_tasks: BackgroundTasks,
     authorization: str = Header(...),
 ):
-    """Trigger a Brain build. Returns immediately — build runs in background."""
+    """Trigger a Brain build. Returns immediately -- build runs in background."""
     db = get_supabase()
 
     # Check no active build running
@@ -152,3 +157,77 @@ async def get_build_history(project_id: str, authorization: str = Header(...)):
         .execute()
     )
     return result.data
+
+
+@router.post("/{project_id}/ingest-doc", status_code=202)
+async def ingest_document(
+    project_id: str,
+    file: UploadFile = File(...),
+    authorization: str = Header(...),
+):
+    """Upload a document to enrich the Brain with product context.
+
+    Supported formats: .md, .txt, .pdf, .docx
+    Max size: 2MB
+
+    The document is extracted, synthesized separately, then cross-linked
+    to existing code entities in the Brain via entity resolution.
+    """
+    import os
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_DOC_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {ext}. Allowed: {', '.join(ALLOWED_DOC_EXTENSIONS)}"
+        )
+
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large: {len(file_bytes)} bytes. Max: {MAX_UPLOAD_SIZE} bytes"
+        )
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # Find the latest complete snapshot to append to
+    db = get_supabase()
+    snapshot = (
+        db.table("brain_snapshots")
+        .select("id")
+        .eq("project_id", project_id)
+        .eq("status", BrainStatus.COMPLETE)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not snapshot.data:
+        raise HTTPException(
+            status_code=404,
+            detail="No complete Brain found. Build the Brain from code first."
+        )
+
+    snapshot_id = snapshot.data[0]["id"]
+
+    file_b64 = base64.b64encode(file_bytes).decode("ascii")
+
+    ingest_doc_task.delay(
+        project_id=project_id,
+        snapshot_id=snapshot_id,
+        filename=file.filename,
+        file_b64=file_b64,
+    )
+
+    log.info("brain.ingest_doc_triggered",
+             project_id=project_id,
+             snapshot_id=snapshot_id,
+             filename=file.filename,
+             size=len(file_bytes))
+
+    return {
+        "status": "accepted",
+        "snapshot_id": snapshot_id,
+        "filename": file.filename,
+        "message": "Document ingestion started. Nodes will be added to the existing Brain."
+    }
