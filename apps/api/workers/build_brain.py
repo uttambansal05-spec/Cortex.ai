@@ -24,6 +24,7 @@ celery_app.conf.update(
 )
 
 
+import workers.ingest_doc  # register ingest_doc task with celery
 @celery_app.task(bind=True, max_retries=1, name="build_brain")
 def build_brain_task(self, project_id: str, snapshot_id: str,
                      incremental: bool = False, changed_files: list[str] | None = None):
