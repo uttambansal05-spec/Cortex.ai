@@ -269,9 +269,10 @@ async def get_existing_nodes(project_id: str, snapshot_id: str,
 async def write_doc_nodes(graph: dict, project_id: str, snapshot_id: str) -> dict:
     """Write doc-sourced nodes and edges to an existing snapshot.
 
-    Unlike write_brain() which creates a new snapshot, this appends
-    to an existing one. Used for document ingestion on top of a
-    code Brain.
+    Uses upsert-on-conflict: if a node with the same fingerprint already
+    exists, we enrich it with additional context from the new source
+    instead of skipping it. This ensures every doc's perspective on a
+    concept is captured in the Brain.
 
     Returns dict with node/edge counts and the new label_to_id mapping.
     """
@@ -281,25 +282,76 @@ async def write_doc_nodes(graph: dict, project_id: str, snapshot_id: str) -> dic
     log.info("brain_writer.writing_doc_nodes", count=len(nodes))
 
     if not nodes:
-        return {"doc_nodes": 0, "doc_edges": 0, "label_to_id": {}}
+        return {"doc_nodes": 0, "doc_edges": 0, "doc_enriched": 0, "label_to_id": {}}
+
+    # Fetch existing fingerprints for this snapshot
+    existing = (
+        db.table("brain_nodes")
+        .select("id, fingerprint, label, summary, source_file, metadata")
+        .eq("snapshot_id", snapshot_id)
+        .eq("project_id", project_id)
+        .execute()
+    )
+    fp_to_existing = {n["fingerprint"]: n for n in (existing.data or [])}
 
     label_to_id = {}
-    batch_size = 50
-    for i in range(0, len(nodes), batch_size):
-        batch = nodes[i:i + batch_size]
-        try:
-            db.table("brain_nodes").insert(batch).execute()
-        except Exception as e:
-            # Handle fingerprint conflicts (node already exists from prior ingest)
-            log.warning("brain_writer.doc_node_conflict", error=str(e)[:100])
-            # Insert one by one to skip conflicts
-            for node in batch:
-                try:
-                    db.table("brain_nodes").insert(node).execute()
-                except Exception:
-                    pass
-        for n in batch:
-            label_to_id[n["label"].lower().strip()] = n["id"]
+    inserted = 0
+    enriched = 0
+
+    for node in nodes:
+        fp = node["fingerprint"]
+        existing_node = fp_to_existing.get(fp)
+
+        if existing_node:
+            # Node exists - enrich it with new context
+            old_summary = existing_node.get("summary") or ""
+            new_summary = node.get("summary") or ""
+            old_meta = existing_node.get("metadata") or {}
+            new_source = node.get("source_file") or ""
+
+            # Collect sources
+            sources = old_meta.get("additional_sources", [])
+            old_source = existing_node.get("source_file") or ""
+            if old_source and old_source not in sources:
+                sources = [old_source] + sources
+            if new_source and new_source not in sources:
+                sources.append(new_source)
+
+            # Merge summary: append new context if it adds information
+            if new_summary and new_summary not in old_summary:
+                merged_summary = f"{old_summary}\n\n[From {new_source}]: {new_summary}"
+                merged_summary = merged_summary[:4000]
+            else:
+                merged_summary = old_summary
+
+            updated_meta = {**old_meta, "additional_sources": sources}
+
+            try:
+                db.table("brain_nodes").update({
+                    "summary": merged_summary,
+                    "metadata": updated_meta,
+                }).eq("id", existing_node["id"]).execute()
+                enriched += 1
+                log.debug("brain_writer.node_enriched",
+                          label=node["label"], new_source=new_source)
+            except Exception as e:
+                log.warning("brain_writer.enrich_failed",
+                            label=node["label"], error=str(e)[:100])
+
+            label_to_id[node["label"].lower().strip()] = existing_node["id"]
+        else:
+            # New node - insert it
+            try:
+                db.table("brain_nodes").insert(node).execute()
+                inserted += 1
+                label_to_id[node["label"].lower().strip()] = node["id"]
+                fp_to_existing[fp] = node
+            except Exception as e:
+                log.warning("brain_writer.doc_node_insert_failed",
+                            label=node["label"], error=str(e)[:100])
+
+    log.info("brain_writer.doc_nodes_done",
+             inserted=inserted, enriched=enriched, total=len(nodes))
 
     # Also include existing nodes in label_to_id for edge resolution
     existing_nodes, existing_map = await get_existing_nodes(project_id, snapshot_id)
@@ -307,27 +359,31 @@ async def write_doc_nodes(graph: dict, project_id: str, snapshot_id: str) -> dic
 
     edges = _extract_edges(graph, full_label_to_id, snapshot_id, project_id)
     if edges:
+        batch_size = 50
         for i in range(0, len(edges), batch_size):
             try:
                 db.table("brain_edges").insert(edges[i:i + batch_size]).execute()
             except Exception as e:
                 log.warning("brain_writer.doc_edge_failed", error=str(e)[:100])
 
-    # Update snapshot metadata to reflect doc additions
+    # Update snapshot metadata
     try:
         snap = db.table("brain_snapshots").select("metadata").eq("id", snapshot_id).single().execute()
         meta = snap.data.get("metadata", {}) if snap.data else {}
-        meta["doc_nodes"] = meta.get("doc_nodes", 0) + len(nodes)
+        meta["doc_nodes_inserted"] = meta.get("doc_nodes_inserted", 0) + inserted
+        meta["doc_nodes_enriched"] = meta.get("doc_nodes_enriched", 0) + enriched
         meta["doc_edges"] = meta.get("doc_edges", 0) + len(edges)
-        meta["total_nodes"] = meta.get("total_nodes", 0) + len(nodes)
+        meta["total_nodes"] = meta.get("total_nodes", 0) + inserted
         meta["total_edges"] = meta.get("total_edges", 0) + len(edges)
         db.table("brain_snapshots").update({"metadata": meta}).eq("id", snapshot_id).execute()
     except Exception as e:
         log.warning("brain_writer.metadata_update_failed", error=str(e)[:100])
 
-    log.info("brain_writer.doc_write_complete", nodes=len(nodes), edges=len(edges))
+    log.info("brain_writer.doc_write_complete",
+             inserted=inserted, enriched=enriched, edges=len(edges))
     return {
-        "doc_nodes": len(nodes),
+        "doc_nodes": inserted,
+        "doc_enriched": enriched,
         "doc_edges": len(edges),
         "label_to_id": label_to_id,
     }
