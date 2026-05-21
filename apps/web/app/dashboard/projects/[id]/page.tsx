@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase/client'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import { Brain, RefreshCw, Search, GitGraph, ArrowLeft, AlertCircle, Clock } from 'lucide-react'
+import DocUpload from '@/components/brain/DocUpload'
 
 export default function ProjectPage() {
   const [project, setProject] = useState<any>(null)
@@ -163,6 +164,33 @@ export default function ProjectPage() {
           </div>
         )}
       </div>
+
+      {isComplete && (
+        <div className="mb-6">
+          <DocUpload projectId={id} onComplete={() => loadSnapshot(id)} />
+        </div>
+      )}
+
+      {isComplete && (meta.doc_nodes_inserted > 0 || meta.doc_nodes > 0) && (
+        <div className="card p-4 mb-6">
+          <div className="flex items-center gap-4 text-xs">
+            <div>
+              <span className="text-foreground font-medium">{meta.doc_nodes_inserted || meta.doc_nodes || 0}</span>
+              <span className="text-foreground-2 ml-1">doc nodes</span>
+            </div>
+            <div className="w-px h-4 bg-border" />
+            <div>
+              <span className="text-foreground font-medium">{meta.doc_nodes_enriched || 0}</span>
+              <span className="text-foreground-2 ml-1">enriched</span>
+            </div>
+            <div className="w-px h-4 bg-border" />
+            <div>
+              <span className="text-foreground font-medium">{meta.doc_edges || 0}</span>
+              <span className="text-foreground-2 ml-1">doc edges</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {isComplete && (
         <div className="grid grid-cols-2 gap-4">
